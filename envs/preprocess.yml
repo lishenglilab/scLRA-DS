@@ -1,0 +1,18 @@
+name: sc_long_preprocess
+channels:
+  - bioconda
+  - default
+dependencies:
+  - python=3.7
+  - Biopython
+  - pandas
+  - numpy
+  - tqdm
+  - matplotlib
+  - pip
+  - pip:
+    - fast-edit-distance==1.2.1
+    - blaze2
+    - NanoPlot
+    - nanofilt==2.8.0
+    - openai

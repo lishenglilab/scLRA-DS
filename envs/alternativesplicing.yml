@@ -1,0 +1,7 @@
+name: alternativesplicing
+channels:
+  - bioconda
+  - default
+dependencies:
+  - python=3.6
+  - suppa=2.3
