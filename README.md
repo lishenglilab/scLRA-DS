@@ -3,7 +3,7 @@
 ![image](https://github.com/lishenglilab/Single-Cell-Long-Read-Transcriptomics-Analysis-Pipeline/blob/main/Schematic.png)
 ## Overview
 
-A comprehensive Nextflow pipeline for analyzing single-cell long-read RNA sequencing data. This pipeline integrates multiple analysis modules to process raw sequencing data from FASTQ files to comprehensive biological interpretation, including alternative splicing analysis, ORF-based clustering, and AI-assisted biological interpretation.
+A comprehensive Nextflow pipeline for analyzing single-cell long-read RNA sequencing data. This pipeline integrates multiple analysis modules to process raw sequencing data from FASTQ files to comprehensive biological interpretation, including alternative splicing analysis, ORF-based clustering, and LLM-assisted biological interpretation.
 
 ## Workflow Structure
 
