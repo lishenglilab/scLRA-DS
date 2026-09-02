@@ -11,16 +11,17 @@ process MAKE_READ_GROUPS {
 
   input:
     val sample_ids
-    val fastqs
+    path fastqs
+    path pipeline_bin
 
   output:
     path "all_read_groups.tsv", emit: read_groups
 
   script:
-    def fq_args  = fastqs.collect { it.toString() }.join(' ')
-    def sid_args = sample_ids.collect { it.toString() }.join(' ')
+    def fq_args  = fastqs.collect { fq -> "\"${fq}\"" }.join(' ')
+    def sid_args = sample_ids.collect { sid -> "\"${sid}\"" }.join(' ')
     """
-    ${projectDir}/bin/make_read_groups.py \
+    python "${pipeline_bin}/make_read_groups.py" \
       --fastq ${fq_args} \
       --sample-id ${sid_args} \
       --out all_read_groups.tsv
@@ -46,20 +47,20 @@ process ISOQUANT_SC {
     path "IsoQuant_sc", emit: isoquant_dir
 
   script:
-    def fastq_args = fastqs.collect { it.toString() }.join(' ')
+    def fastq_args = fastqs.collect { fq -> "\"${fq}\"" }.join(' ')
     """
     mkdir -p IsoQuant_sc
 
     isoquant.py \
-      --reference ${reference_fa} \
-      --genedb ${genedb_gtf} \
+      --reference "${reference_fa}" \
+      --genedb "${genedb_gtf}" \
       --complete_genedb \
       --fastq ${fastq_args} \
       --data_type nanopore \
       -o IsoQuant_sc \
       --threads ${params.threads ?: 10} \
       --sqanti_output \
-      --read_group file:${read_groups_tsv}
+      --read_group "file:${read_groups_tsv}"
     """
 }
 
@@ -93,7 +94,7 @@ process EXTRACT_TRANSCRIPTS {
     cp "\$GTF" OUT.transcript_models.gtf
 
     gffread OUT.transcript_models.gtf \
-      -g ${reference_fa} \
+      -g "${reference_fa}" \
       -w OUT.transcript_models.fa
 
     if [[ ! -s OUT.transcript_models.fa ]]; then
@@ -140,14 +141,15 @@ process ORF_CALL {
 
   input:
     path transcript_fa_1line
+    path pipeline_bin
 
   output:
     path "ORF.fa", emit: orf_fa
 
   script:
     """
-    python ${projectDir}/bin/ORF_generate.py \
-      -i ${transcript_fa_1line} \
+    python "${pipeline_bin}/ORF_generate.py" \
+      -i "${transcript_fa_1line}" \
       -o . \
       -p ORF
 
@@ -156,44 +158,40 @@ process ORF_CALL {
 }
 
 /*
- * Transcriptome assembly quality assessment using DeepSeek API
+ * Optional transcriptome assembly quality assessment using an LLM API
  */
-process ASSEMBLY_QC {
+process LLM_ASSEMBLY_QC {
   label 'preprocess'
-  tag "assembly_qc"
+  tag "llm_assembly_qc"
   
   publishDir "${params.outdir ?: 'Result'}/AlignmentAndTranscriptReconstruction/assembly_qc", mode: 'copy'
   
-  when:
-    params.api_key && params.api_key != '' && params.api_key != '""'
-  
   input:
     path isoquant_dir
+    path pipeline_bin
   
   output:
     path "assembly_qc_report.txt", emit: assembly_qc_report
+    path "assembly_qc_report_metrics.json", emit: assembly_qc_metrics
+
+  when:
+    params.llm_enabled
   
   script:
     """
-    # Check if API key is provided
-    if [[ -z "${params.api_key}" ]] || [[ "${params.api_key}" == "" ]]; then
-      echo "Assembly QC skipped: API key not configured" >&2
-      touch assembly_qc_report.txt
-      exit 0
-    fi
-    
     # Debug: show directory contents
     echo "IsoQuant directory: ${isoquant_dir}"
     echo "Directory contents:"
     ls -la "${isoquant_dir}/OUT/" 2>/dev/null || echo "OUT directory not found"
     
     # Run the Python script
-    python ${projectDir}/bin/deepseek/assembly_qc_deepseek.py \
+    python "${pipeline_bin}/llm/assembly_qc.py" \
       --isoquant_dir "${isoquant_dir}" \
-      --api_key "${params.api_key}" \
       --output_text_file "assembly_qc_report.txt" \
       --species "${params.species ?: 'Unknown'}" \
       --tissue "${params.tissue ?: 'Unknown'}" \
+      --base_url "${params.llm_base_url}" \
+      --model "${params.llm_model}" \
       --save_metrics
     
     # Check if report was generated
@@ -216,12 +214,14 @@ workflow AlignmentAndTranscriptReconstruction {
     genedb_gtf
 
   main:
+    pipeline_bin = file("${projectDir}/bin", checkIfExists: true)
+
     // Collect sample IDs and fastq files separately for MAKE_READ_GROUPS
-    sample_ids = filtered_fastq.map { sid, fq -> sid }.collect()
-    hq_fastqs  = filtered_fastq.map { sid, fq -> fq  }.collect()
+    sample_ids = filtered_fastq.map { sid, _fq -> sid }.collect()
+    hq_fastqs  = filtered_fastq.map { _sid, fq -> fq }.collect()
 
     // Create read groups file
-    rg = MAKE_READ_GROUPS(sample_ids, hq_fastqs)
+    rg = MAKE_READ_GROUPS(sample_ids, hq_fastqs, pipeline_bin)
     
     // Run IsoQuant
     iso = ISOQUANT_SC(reference_fa, genedb_gtf, rg.read_groups, hq_fastqs)
@@ -230,10 +230,10 @@ workflow AlignmentAndTranscriptReconstruction {
     tx = EXTRACT_TRANSCRIPTS(reference_fa, iso.isoquant_dir)
     
     // Call ORFs
-    orf = ORF_CALL(tx.models_fa_1line)
+    orf = ORF_CALL(tx.models_fa_1line, pipeline_bin)
     
     // Assembly quality assessment (optional, requires API key)
-    assembly_qc = ASSEMBLY_QC(iso.isoquant_dir)
+    assembly_qc = LLM_ASSEMBLY_QC(iso.isoquant_dir, pipeline_bin)
 
   emit:
     filtered_fastq  = filtered_fastq      // Pass through for downstream use
@@ -244,4 +244,5 @@ workflow AlignmentAndTranscriptReconstruction {
     models_fa_1line = tx.models_fa_1line
     orf_fa          = orf.orf_fa
     assembly_qc_report = assembly_qc.assembly_qc_report
+    assembly_qc_metrics = assembly_qc.assembly_qc_metrics
 }

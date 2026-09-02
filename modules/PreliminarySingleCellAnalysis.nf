@@ -106,6 +106,7 @@ process RUN_SC_ANALYSIS {
   input:
     path gene_matrix_dir
     path transcript_matrix_dir
+    path pipeline_bin
   
   output:
     path "sce.gene.rds", emit: seurat_gene
@@ -118,14 +119,18 @@ process RUN_SC_ANALYSIS {
   script:
     """
     # Run R analysis script
-    Rscript ${projectDir}/bin/preliminary_single_cell_analysis.R \
+    "${params.rscript_bin ?: 'Rscript'}" "${pipeline_bin}/preliminary_single_cell_analysis.R" \
       --gene_matrix "${gene_matrix_dir}" \
       --transcript_matrix "${transcript_matrix_dir}" \
       --output_dir "." \
       --species "${params.species ?: 'Human'}" \
       --tissue "${params.tissue ?: 'Skin'}" \
-      --project_dir "${projectDir}" \
-      ${params.api_key && params.api_key != '' ? "--api_key \"${params.api_key}\"" : ""}
+      --project_dir "." \
+      --min_cells ${params.min_cells ?: 10} \
+      --min_features ${params.min_features ?: 200} \
+      --llm_enabled "${params.llm_enabled}" \
+      --llm_base_url "${params.llm_base_url}" \
+      --llm_model "${params.llm_model}"
     
     echo "Single-cell analysis completed"
     echo "Generated files:"
@@ -134,33 +139,27 @@ process RUN_SC_ANALYSIS {
 }
 
 /*
- * Generate single-cell QC report using DeepSeek API
+ * Generate an optional single-cell QC report using an LLM API
  */
-process SC_QC_REPORT {
+process LLM_SC_QC_REPORT {
   label 'preprocess'
-  tag "sc_qc_report"
+  tag "llm_sc_qc_report"
   
+  // Keep the historical directory name so existing result consumers do not break.
   publishDir "${params.outdir ?: 'Result'}/PreliminarySingleCellAnalysis/deepseek_qc", mode: 'copy'
-  
-  when:
-    params.api_key && params.api_key != '' && params.api_key != '""'
   
   input:
     path qc_metrics
+    path pipeline_bin
   
   output:
     path "sc_qc_report.txt", emit: sc_qc_report
+
+  when:
+    params.llm_enabled
   
   script:
     """
-    # Check if API key is provided
-    if [[ -z "${params.api_key}" ]] || [[ "${params.api_key}" == "" ]]; then
-      echo "Single-cell QC report skipped: API key not configured" >&2
-      touch sc_qc_report.txt
-      echo "No API key provided, skipping DeepSeek QC report" > sc_qc_report.txt
-      exit 0
-    fi
-    
     # Check if qc_metrics file exists
     if [[ ! -f "${qc_metrics}" ]]; then
       echo "ERROR: QC metrics file not found: ${qc_metrics}" >&2
@@ -168,13 +167,13 @@ process SC_QC_REPORT {
     fi
     
     # Run Python script to generate QC report
-    python ${projectDir}/bin/deepseek/cell_qc_deekseek.py \
+    python "${pipeline_bin}/llm/cell_qc.py" \
       --csv_file_path "${qc_metrics}" \
-      --api_key "${params.api_key}" \
       --output_text_file "sc_qc_report.txt" \
       --species "${params.species ?: 'Human'}" \
       --tissue "${params.tissue ?: 'Skin'}" \
-      --model "${params.deepseek_model ?: 'deepseek-reasoner'}"
+      --base_url "${params.llm_base_url}" \
+      --model "${params.llm_model}"
     
     # Check if report was generated
     if [[ ! -s "sc_qc_report.txt" ]]; then
@@ -195,15 +194,21 @@ workflow PreliminarySingleCellAnalysis {
     isoquant_dir
   
   main:
+    pipeline_bin = file("${projectDir}/bin", checkIfExists: true)
+
     // Prepare gene and transcript matrices
     gene_matrix = PREPARE_GENE_MATRIX(isoquant_dir)
     transcript_matrix = PREPARE_TRANSCRIPT_MATRIX(isoquant_dir)
     
     // Run single-cell analysis
-    sc_results = RUN_SC_ANALYSIS(gene_matrix.gene_matrix_dir, transcript_matrix.transcript_matrix_dir)
+    sc_results = RUN_SC_ANALYSIS(
+      gene_matrix.gene_matrix_dir,
+      transcript_matrix.transcript_matrix_dir,
+      pipeline_bin
+    )
     
     // Generate QC report (optional, requires API key)
-    qc_report = SC_QC_REPORT(sc_results.qc_metrics)
+    qc_report = LLM_SC_QC_REPORT(sc_results.qc_metrics, pipeline_bin)
   
   emit:
     seurat_gene = sc_results.seurat_gene     // sce.gene.rds
@@ -212,5 +217,7 @@ workflow PreliminarySingleCellAnalysis {
     marker_tables = sc_results.marker_tables
     qc_metrics = sc_results.qc_metrics
     annotation_files = sc_results.annotation_files  // optional
+    llm_qc_report = qc_report.sc_qc_report
+    // Backward-compatible output name.
     sc_qc_report = qc_report.sc_qc_report
 }

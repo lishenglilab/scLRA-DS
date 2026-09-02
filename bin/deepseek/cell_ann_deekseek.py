@@ -1,6 +1,17 @@
 import pandas as pd
-from openai import OpenAI
 import argparse
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from llm.client import add_llm_arguments, client_from_args, response_text
+
+
+def normalize_cluster_id(value):
+    """Return the identifier part of either ``0`` or ``Cluster 0``."""
+    cluster_id = re.sub(r"^cluster\s*", "", str(value).strip(), flags=re.IGNORECASE)
+    return cluster_id.strip()
 
 prompt_basic = """ Annotate cell clusters for {species_type} {tissue_type} restricting output STRICTLY to Major Cell Lineages. PROHIBITED: Subtypes, subsets, activation states, anatomical location specificity, or disease states. REQUIRED: Output must map to the highest-level biological category applicable to {tissue_type}.
 Each cluster and its corresponding cell type should be listed on a separate line in the format: Cluster X: [Cell Type].
@@ -103,24 +114,29 @@ If core markers are absent or unrecognizable, apply the following steps sequenti
     9.4  Blacklist: Maintain a list of commonly misannotated terms (e.g., "Fibroblast" in brain). Blacklisted terms require ≥ 1 tissue-specific marker in Top_5 to be accepted. ** Maintain a list of commonly misannotated terms requiring additional validation.
 """
 
-def cell_ann_gpt(args):
+def cell_ann_llm(args):
     """
-    Automatically annotate cell types using DeepSeek API based on gene expression data.
+    Automatically annotate cell types using an OpenAI-compatible API.
     
     Parameters:
     args (Namespace): Arguments passed from the command line.
     
     Returns:
-    str: Cell type annotation results returned by the DeepSeek API.
+    str: Cell type annotation results returned by the configured API.
     list: Conversation history containing requests and responses.
     """
-    client = OpenAI(
-        api_key=args.api_key,
-        base_url='https://api.deepseek.com'
-    )
+    client = client_from_args(args)
 
     # Read CSV file
-    df = pd.read_csv(args.csv_file_path, header=None)
+    df = pd.read_csv(
+        args.csv_file_path,
+        header=None,
+        usecols=[0, 1],
+        dtype=str,
+        keep_default_na=False,
+    )
+    if df.shape[1] < 2:
+        raise ValueError("Marker CSV must contain at least cluster and gene columns")
 
     pre_prompt = (f"Annotate cell clusters for {args.species_type} {args.tissue_type} restricting output STRICTLY to Major Cell Lineages. "
                   f"PROHIBITED: Subtypes, subsets, activation states, anatomical location specificity, or disease states. "
@@ -131,16 +147,31 @@ def cell_ann_gpt(args):
     # Conversation history
     dialogue_history = []
 
-    # Extract cluster and gene information
-    clusters = df.iloc[:, 0].tolist()
-    genes = df.iloc[:, 1].str.split(',').tolist()
+    # Accept both one-gene-per-row files produced by the R workflow and direct
+    # callers that provide a comma-separated gene list per cluster.
+    cluster_genes = {}
+    for raw_cluster, raw_genes in df.iloc[:, :2].itertuples(index=False, name=None):
+        cluster = normalize_cluster_id(raw_cluster)
+        if not cluster:
+            continue
+        gene_list = [gene.strip() for gene in str(raw_genes).split(",") if gene.strip()]
+        existing = cluster_genes.setdefault(cluster, [])
+        for gene in gene_list:
+            if gene not in existing:
+                existing.append(gene)
+
+    if not cluster_genes:
+        raise ValueError("Marker CSV does not contain any non-empty cluster/gene rows")
     
     # Build system prompt
-    system_prompt = pre_prompt + prompt_basic
+    system_prompt = pre_prompt + prompt_basic.format(
+        species_type=args.species_type,
+        tissue_type=args.tissue_type,
+    )
     messages = [{"role": "system", "content": system_prompt}]  # Initialize messages list
 
     user_prompt_content = ""  # Accumulate prompts for all clusters
-    for cluster, gene_list in zip(clusters, genes):
+    for cluster, gene_list in cluster_genes.items():
         # Limit the number of genes to display
         gene_list = gene_list[:args.max_genes_to_display]
 
@@ -150,51 +181,55 @@ def cell_ann_gpt(args):
 
     messages.append({"role": "user", "content": user_prompt_content})  # Add user content
 
-    # Send the final prompt to DeepSeek API
+    # Send the final prompt to the configured API.
     completion = client.chat.completions.create(
         model=args.model,
         messages=messages
     )
 
     # Record API response
-    response_content = completion.choices[0].message.content
+    response_content = response_text(completion)
     dialogue_history.append({"prompt": messages, "response": response_content, "role": "assistant"})  # Record the conversation
 
     # Parse the response content into annotations for each cluster
-    annotated_cells = []
+    annotated_cells = {}
     lines = response_content.strip().split('\n')
-    cluster_count = 0
 
     for line in lines:
-        if line.startswith("Cluster"):
-            try:
-                parts = line.split(":")
-                cluster_id = parts[0].strip()
-                cell_type = parts[1].strip()
-                annotated_cells.append({"Cluster": cluster_id, "Cell Type": cell_type})
-            except IndexError:
-                # If cannot split into two columns, automatically generate a Cluster column
-                cluster_id = f"Cluster{cluster_count}"
-                cell_type = line.strip()
-                cluster_count += 1
-                annotated_cells.append({"Cluster": cluster_id, "Cell Type": cell_type})
+        match = re.match(r"^\s*Cluster\s*([^:]+?)\s*:\s*(.+?)\s*$", line, flags=re.IGNORECASE)
+        if not match:
+            continue
+        cluster_id = normalize_cluster_id(match.group(1))
+        cell_type = match.group(2).strip()
+        if cluster_id in cluster_genes and cell_type:
+            annotated_cells[cluster_id] = cell_type
+
+    if not annotated_cells:
+        raise RuntimeError("LLM response contained no parseable cluster annotations")
+    missing_clusters = [cluster for cluster in cluster_genes if cluster not in annotated_cells]
+    if missing_clusters:
+        raise RuntimeError(
+            "LLM response omitted cluster annotations: " + ", ".join(missing_clusters)
+        )
 
     # Save results to CSV file
-    annotated_df = pd.DataFrame(annotated_cells)
+    annotated_df = pd.DataFrame(
+        [{"Cluster": f"Cluster{cluster}", "Cell Type": cell_type}
+         for cluster, cell_type in annotated_cells.items()]
+    )
     annotated_df.to_csv(args.output_csv, index=False)
     print(f"Annotation results saved to {args.output_csv}")
 
-    # Return DeepSeek API response and conversation history
+    # Return API response and conversation history.
     return response_content, dialogue_history
 
 
 def main():
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="Automatically annotate cell types using DeepSeek API")
+    parser = argparse.ArgumentParser(description="Automatically annotate cell types using an OpenAI-compatible API")
     
     # Required arguments
     parser.add_argument('--csv_file_path', required=True, help='Path to CSV file containing cluster and gene information')
-    parser.add_argument('--api_key', required=True, help='DeepSeek API key')
     parser.add_argument('--output_csv', required=True, help='Output CSV file path')
     
     # Optional arguments (with defaults)
@@ -202,14 +237,15 @@ def main():
     parser.add_argument('--species_type', default='human', help='Species type, default is "human"')
     parser.add_argument('--max_genes_to_display', type=int, default=30, 
                        help='Maximum number of genes to display per cluster, default is 30')
-    parser.add_argument('--model', default='deepseek-reasoner', 
-                       help='DeepSeek model to use, default is "deepseek-reasoner"')
+    add_llm_arguments(parser)
     
     # Parse arguments
     args = parser.parse_args()
     
-    # Call cell annotation function
-    annotation_result, dialogue_history = cell_ann_gpt(args)
+    try:
+        annotation_result, dialogue_history = cell_ann_llm(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     
     return annotation_result
 

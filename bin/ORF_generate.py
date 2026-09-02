@@ -7,9 +7,9 @@ def getOptions(args=sys.argv[1:]):
 
     parser = argparse.ArgumentParser(description="Parses command.")
 
-    parser.add_argument("-i", "--input", help="Your input fasta file.")
+    parser.add_argument("-i", "--input", required=True, help="Your input fasta file.")
 
-    parser.add_argument("-o", "--output", help="Your output path.")
+    parser.add_argument("-o", "--output", required=True, help="Your output path.")
 
     parser.add_argument("-p", "--prefix",default='ORF', help="Your output name prefix.")
 
@@ -23,8 +23,6 @@ options = getOptions(sys.argv[1:])
 import pyfastx
 
 import sys
-
-import pysam
 
 import re
 
@@ -91,7 +89,8 @@ def orf_find(fastafile=options.input, outpath=options.output,prefix=options.pref
       if len(orflist) == 0:
         print('transcript '+name+' does not have orf');
         continue;
-      orflist=list(set(orflist));
+      # Preserve discovery order so repeated runs produce the same FASTA order.
+      orflist=list(dict.fromkeys(orflist));
       orflist=[ x for x in orflist if len(x)>=18 ];
       if len(orflist) == 0:
         print('transcript '+name+' does not have orf which length over 5!');
@@ -105,6 +104,9 @@ def orf_find(fastafile=options.input, outpath=options.output,prefix=options.pref
             orf_len=(orf_end - orf_start);
             seq_pep=translate(orflist[i]);
             peplist.append([orf_start,orf_end,orf_len,seq_pep]);
+      if len(peplist) == 0:
+        print('transcript '+name+' does not have an ORF containing only A/C/G/T bases');
+        continue;
       peplist=pd.DataFrame(peplist,columns=('start','end','length','seq'));
       peplist_simple=peplist.groupby('end').apply(lambda x:x[x['length']==max(x['length'])]);
       peplist_simple['start']=peplist_simple['start'].astype('str');

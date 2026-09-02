@@ -1,7 +1,7 @@
 name: sc_long_preprocess
 channels:
   - bioconda
-  - default
+  - defaults
 dependencies:
   - python=3.7
   - Biopython
@@ -15,4 +15,4 @@ dependencies:
     - blaze2
     - NanoPlot
     - nanofilt==2.8.0
-    - openai
+    - openai>=1,<2

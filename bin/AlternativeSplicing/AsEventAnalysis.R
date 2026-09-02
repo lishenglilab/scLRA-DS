@@ -81,20 +81,46 @@ log_message("Loading data...")
 
 # Load PSI data
 psi <- fread(psi_file, sep = '\t', data.table = FALSE)
+if (ncol(psi) < 2) {
+  stop("PSI input must contain an ASE column and at least one cell column")
+}
 log_message(paste("Loaded PSI data with", nrow(psi), "events and", ncol(psi)-1, "cells"))
 
 # Filter ASE events (expressed in at least min_cell_prop of cells)
-ase_keep <- rowSums(psi[, -1] > 0) >= min_cell_prop * (ncol(psi) - 1)
+ase_keep <- rowSums(psi[, -1, drop = FALSE] > 0, na.rm = TRUE) >=
+  min_cell_prop * (ncol(psi) - 1)
 psi_filtered <- psi[ase_keep, ]
 log_message(paste("Filtered to", nrow(psi_filtered), 
                   "ASE events expressed in >=", min_cell_prop*100, "% of cells"))
+
+if (nrow(psi_filtered) == 0) {
+  writeLines(
+    c(
+      "=== ASE ANALYSIS STATISTICS ===",
+      "",
+      paste("Total_ASE_events:", nrow(psi)),
+      "Filtered_ASE_events: 0",
+      paste("Number_of_cells:", ncol(psi) - 1),
+      paste("Min_cell_proportion:", min_cell_prop),
+      "No ASE events passed the configured prevalence threshold."
+    ),
+    output_stats
+  )
+  writeLines(capture.output(sessionInfo()), file.path(output_dir, "session_info.txt"))
+  writeLines(capture.output(opt), file.path(output_dir, "command_args.txt"))
+  log_message("No ASE events passed filtering; wrote an empty-result summary.")
+  quit(save = "no", status = 0)
+}
 
 # Load Seurat object and get cell metadata
 log_message("Loading Seurat object...")
 sce.tr <- readRDS(seurat_rds)
 col_data <- data.frame(cell_id = colnames(psi_filtered)[-1])
-col_data$sample <- gsub('_.*', '', col_data$cell_id)
+col_data$sample <- sub('_[^_]+$', '', col_data$cell_id)
 col_data <- col_data[col_data$cell_id %in% colnames(sce.tr), ]
+if (nrow(col_data) == 0) {
+  stop("No PSI cell IDs matched the Seurat object")
+}
 psi_filtered <- psi_filtered[, c('ASE', col_data$cell_id)]
 log_message(paste("Matched", nrow(col_data), "cells between PSI and Seurat data"))
 
@@ -140,7 +166,19 @@ df_b <- data.frame(
 
 # Load structural category data
 if (file.exists(novel_vs_known_file)) {
-  structural_category <- fread(novel_vs_known_file, sep = "\t", header = FALSE)
+  first_field <- scan(
+    novel_vs_known_file,
+    what = character(),
+    sep = "\t",
+    nmax = 1,
+    quiet = TRUE
+  )
+  has_header <- length(first_field) == 1 && sub("^#", "", first_field) == "isoform"
+  structural_category <- fread(
+    novel_vs_known_file,
+    sep = "\t",
+    header = has_header
+  )
   if (ncol(structural_category) >= 6) {
     structural_category <- structural_category[, c(1, 6)]
     colnames(structural_category) <- c('isoform', 'structural_category')
@@ -221,7 +259,7 @@ log_message(paste("Saved prevalence plot to:", output_plot_prevalence))
 # Plot 4: Sample-level ASE analysis (stacked bar + upset plot)
 # ----------------------------------------------------------------------
 log_message("Creating sample-level ASE analysis...")
-sample_ids <- str_extract(names(psi_filtered)[-1], "^[A-Z0-9]+")
+sample_ids <- col_data$sample
 unique_samples <- unique(sample_ids)
 
 # Calculate ASE statistics per sample
@@ -229,7 +267,10 @@ ase_stats <- lapply(unique_samples, function(sample) {
   sample_cols <- which(sample_ids == sample)
   
   # Get ASEs expressed in > min_cell_prop of cells for this sample
-  expressed_ases <- rowSums(psi_filtered[, sample_cols] > 0) > min_cell_prop * length(sample_cols)
+  expressed_ases <- rowSums(
+    psi_filtered[, sample_cols + 1L, drop = FALSE] > 0,
+    na.rm = TRUE
+  ) > min_cell_prop * length(sample_cols)
   ase_names <- psi_filtered[[1]][expressed_ases]
   
   list(

@@ -43,19 +43,38 @@ def infer_sample_id_from_path(p: str) -> str:
 
 
 def iter_read_groups(fastq_gz: str, sample_id: str):
-    with gzip.open(fastq_gz, "rt") as f:
+    opener = gzip.open if fastq_gz.endswith(".gz") else open
+    with opener(fastq_gz, "rt") as f:
+        record_number = 0
         while True:
-            header = f.readline().rstrip()
-            if not header:
+            raw_header = f.readline()
+            if raw_header == "":
                 break
+            record_number += 1
+            header = raw_header.rstrip("\r\n")
 
             # FASTQ 4-line record: header, seq, '+', qual
-            f.readline()
-            f.readline()
-            f.readline()
+            raw_sequence = f.readline()
+            raw_separator = f.readline()
+            raw_quality = f.readline()
+            if not raw_sequence or not raw_separator or not raw_quality:
+                raise ValueError(f"Incomplete FASTQ record after header: {header}")
 
             if not header.startswith("@"):
-                continue
+                raise ValueError(
+                    f"FASTQ record {record_number} has an invalid header: {header}"
+                )
+            separator = raw_separator.rstrip("\r\n")
+            if not separator.startswith("+"):
+                raise ValueError(
+                    f"FASTQ record {record_number} has an invalid separator line"
+                )
+            sequence = raw_sequence.rstrip("\r\n")
+            quality = raw_quality.rstrip("\r\n")
+            if len(sequence) != len(quality):
+                raise ValueError(
+                    f"FASTQ record {record_number} has sequence/quality length mismatch"
+                )
 
             read_id = header[1:].split()[0]
             cell_barcode = read_id.split("_")[0] if "_" in read_id else read_id
@@ -97,15 +116,22 @@ def main():
     else:
         sample_ids = [infer_sample_id_from_path(p) for p in fastqs]
 
+    missing_fastqs = [fq for fq in fastqs if not os.path.isfile(fq)]
+    if missing_fastqs:
+        raise SystemExit("Missing input FASTQ files: " + ", ".join(missing_fastqs))
+
+    invalid_sample_ids = [
+        sid for sid in sample_ids
+        if not str(sid).strip() or any(char in str(sid) for char in "\t\r\n")
+    ]
+    if invalid_sample_ids:
+        raise SystemExit("Sample IDs must be non-empty and cannot contain tabs/newlines")
+
     n_files = 0
     n_rows = 0
 
     with open(outp, "w") as out:
         for fq, sid in zip(fastqs, sample_ids):
-            if not os.path.exists(fq):
-                print(f"WARNING: missing file: {fq} (skipping)", file=sys.stderr)
-                continue
-
             n_files += 1
             print(f"Processing {fq} as sample_id={sid}", file=sys.stderr)
 
@@ -115,6 +141,8 @@ def main():
 
     if n_files == 0:
         raise SystemExit("No input FASTQ files exist; nothing written.")
+    if n_rows == 0:
+        raise SystemExit("Input FASTQ files contained no read records; nothing written.")
 
     print(
         f"Done. Wrote {n_rows} read_group rows from {n_files} FASTQ files to {outp}",
@@ -124,4 +152,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

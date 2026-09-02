@@ -1,6 +1,18 @@
 import argparse
-from openai import OpenAI
 import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from llm.client import add_llm_arguments, client_from_args, response_text
+
+
+NUMBER_PATTERN = r"[-+]?(?:\d[\d,]*)(?:\.\d+)?"
+
+
+def parse_number(value):
+    """Parse NanoPlot numbers that may contain commas and decimals."""
+    return float(value.replace(",", ""))
 
 def parse_nanostats_file(file_path):
     """
@@ -21,54 +33,61 @@ def parse_nanostats_file(file_path):
     def safe_search(pattern, content, default=None):
         match = re.search(pattern, content)
         if match:
-            return float(match.group(1)) if default is None else match.group(1)
+            return parse_number(match.group(1))
         return default
 
     # Extract the data using safe_search
-    metrics['mean_read_length'] = safe_search(r"Mean read length:\s*(\d+\.\d+)", content)
-    metrics['mean_read_quality'] = safe_search(r"Mean read quality:\s*(\d+\.\d+)", content)
-    metrics['median_read_length'] = safe_search(r"Median read length:\s*(\d+\.\d+)", content)
-    metrics['median_read_quality'] = safe_search(r"Median read quality:\s*(\d+\.\d+)", content)
-    metrics['number_of_reads'] = safe_search(r"Number of reads:\s*(\d+)", content, default=0)
-    metrics['read_length_n50'] = safe_search(r"Read length N50:\s*(\d+\.\d+)", content)
-    metrics['stdev_read_length'] = safe_search(r"STDEV read length:\s*(\d+\.\d+)", content)
-    metrics['total_bases'] = safe_search(r"Total bases:\s*(\d+\.\d+)", content)
+    metrics['mean_read_length'] = safe_search(rf"Mean read length:\s*({NUMBER_PATTERN})", content)
+    metrics['mean_read_quality'] = safe_search(rf"Mean read quality:\s*({NUMBER_PATTERN})", content)
+    metrics['median_read_length'] = safe_search(rf"Median read length:\s*({NUMBER_PATTERN})", content)
+    metrics['median_read_quality'] = safe_search(rf"Median read quality:\s*({NUMBER_PATTERN})", content)
+    metrics['number_of_reads'] = int(safe_search(rf"Number of reads:\s*({NUMBER_PATTERN})", content, default=0))
+    metrics['read_length_n50'] = safe_search(rf"Read length N50:\s*({NUMBER_PATTERN})", content)
+    metrics['stdev_read_length'] = safe_search(rf"STDEV read length:\s*({NUMBER_PATTERN})", content)
+    metrics['total_bases'] = safe_search(rf"Total bases:\s*({NUMBER_PATTERN})", content)
 
     # Parsing quality cutoff information
-    quality_cutoffs = re.findall(r">Q(\d+):\s*(\d+)\s*\((\d+\.\d+)%\)\s*(\d+\.?\d*)Mb", content)
+    quality_cutoffs = re.findall(
+        rf">Q(\d+):\s*({NUMBER_PATTERN})\s*\(({NUMBER_PATTERN})%\)\s*({NUMBER_PATTERN})Mb",
+        content,
+    )
     metrics['quality_cutoffs'] = {}
     for cutoff in quality_cutoffs:
         quality_score, count, percentage, mb = cutoff
         metrics['quality_cutoffs'][f'Q{quality_score}'] = {
-            'count': int(count),
-            'percentage': float(percentage),
-            'megabases': float(mb.replace('Mb', ''))
+            'count': int(parse_number(count)),
+            'percentage': parse_number(percentage),
+            'megabases': parse_number(mb)
         }
 
     # Parsing top reads information (mean basecall quality)
-    top_reads = re.findall(r"(\d+):\s*(\d+\.\d+)\s*\((\d+)\)", content)
-    metrics['top_reads_quality'] = [(int(top[0]), float(top[1]), int(top[2])) for top in top_reads]
+    top_reads = re.findall(
+        rf"(\d+):\s*({NUMBER_PATTERN})\s*\(({NUMBER_PATTERN})\)",
+        content.split("Top 5 longest reads", 1)[0],
+    )
+    metrics['top_reads_quality'] = [
+        (int(top[0]), parse_number(top[1]), int(parse_number(top[2])))
+        for top in top_reads
+    ]
 
     return metrics
 
 
-def generate_qc_report(metrics, api_key, species="Human", tissue="Skin", model="deepseek-reasoner", output_text_file='qc_report.txt'):
+def generate_qc_report(metrics, client, species="Human", tissue="Skin", model="deepseek-reasoner", output_text_file='qc_report.txt'):
     """
     Generate a quality control report from the parsed NanoStats data.
     
     Parameters:
     metrics (dict): Dictionary containing parsed sequencing metrics.
-    api_key (str): API key for the model.
+    client: Configured OpenAI-compatible client.
     species (str): The species of the sample (default is "Human").
     tissue (str): The tissue type of the sample (default is "Skin").
-    model (str): The model to use (default is "deepseek-reasoner").
+    model (str): Model name exposed by the configured endpoint.
     output_text_file (str): Path to save the generated QC report.
     
     Returns:
     str: The content of the generated QC report.
     """
-    client = OpenAI(api_key=api_key, base_url='https://api.deepseek.com')
-
     # Construct the system prompt based on the parsed data and provided species/tissue
     system_prompt = (
         f"Generate a quality control report for the following single-cell Nanopore long-read RNA-seq data from {species} {tissue} tissue. "
@@ -92,7 +111,7 @@ def generate_qc_report(metrics, api_key, species="Human", tissue="Skin", model="
     for i, (read_num, quality, length) in enumerate(metrics['top_reads_quality']):
         system_prompt += f"{i + 1}: {read_num} (Quality: {quality}, Length: {length} bp)\n"
 
-    # Sending the request to DeepSeek API
+    # Send the request to the configured OpenAI-compatible API.
     messages = [{"role": "system", "content": system_prompt}]
     
     completion = client.chat.completions.create(
@@ -101,7 +120,7 @@ def generate_qc_report(metrics, api_key, species="Human", tissue="Skin", model="
     )
 
     # Get the response content from the model
-    response_content = completion.choices[0].message.content
+    response_content = response_text(completion)
     
     # Save the result to the output text file
     with open(output_text_file, 'w') as f:
@@ -118,33 +137,42 @@ def main():
     
     # Arguments
     parser.add_argument('--file_path', required=True, help='Path to the NanoStats text file')
-    parser.add_argument('--api_key', required=True, help='API key for DeepSeek model')
     parser.add_argument('--output_text_file', required=True, help='Path to save the output QC report')
     parser.add_argument('--species', default="Human", help='The species of the sample (default: Human)')
     parser.add_argument('--tissue', default="Skin", help='The tissue type of the sample (default: Skin)')
-    parser.add_argument('--model', default="deepseek-reasoner", help='The model to use (default: deepseek-reasoner)')
+    add_llm_arguments(parser)
 
     # Parse the arguments
     args = parser.parse_args()
 
+    try:
+        client = client_from_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     # Parse the NanoStats file and extract metrics
     metrics = parse_nanostats_file(args.file_path)
 
-    # Generate the QC report
-    generate_qc_report(
-        metrics, 
-        api_key=args.api_key, 
-        species=args.species, 
-        tissue=args.tissue, 
-        model=args.model, 
-        output_text_file=args.output_text_file
-    )
+    # Keep this optional reporting step from aborting the biological workflow
+    # when the configured provider is temporarily unavailable.
+    try:
+        generate_qc_report(
+            metrics,
+            client=client,
+            species=args.species,
+            tissue=args.tissue,
+            model=args.model,
+            output_text_file=args.output_text_file,
+        )
+    except Exception as exc:
+        error_report = (
+            "Failed to generate the read QC report via the configured LLM API.\n"
+            f"Error: {exc}\n"
+        )
+        with open(args.output_text_file, "w") as handle:
+            handle.write(error_report)
+        print(error_report, file=sys.stderr)
 
 
 if __name__ == '__main__':
     main()
-
-#python /data/haowu/sc_long_v2/pipline_v2/bin/read_qc_deekseep.py --file_path /data/haowu/sc_long_v2/pipline_v2/demo/all_samples_NanoStats.txt \
-                          # --api_key sk-403bc4c7826a475e9646978562cb324a \
-                          # --output_text_file /data/haowu/sc_long_v2/pipline_v2/demo/qc_report.txt \
-                          # --species "Human" --tissue "Skin"

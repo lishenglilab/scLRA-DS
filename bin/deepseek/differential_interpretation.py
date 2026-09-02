@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""
-Differential Analysis Interpretation using DeepSeek API
-Analyzes genes that appear in all four differential analysis sets and provides biological interpretation
-"""
+"""LLM interpretation of genes shared by four differential analyses."""
 
 import pandas as pd
 import argparse
 import sys
 import os
-from openai import OpenAI
 import json
 from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from llm.client import (
+    add_llm_arguments,
+    client_from_args,
+    response_text,
+    response_total_tokens,
+)
 
 def parse_differential_results(result_dir, comparison_name):
     """
@@ -134,7 +139,7 @@ def find_intersection_genes(differential_results):
     if len(gene_sets) == 4:
         intersection_genes = set.intersection(*gene_sets.values())
         print(f"\nGenes in intersection of all 4 analyses: {len(intersection_genes)}")
-        return list(intersection_genes), gene_sets
+        return sorted(intersection_genes), gene_sets
     else:
         print(f"ERROR: Not all gene sets available. Found {len(gene_sets)} sets.")
         print(f"Available sets: {list(gene_sets.keys())}")
@@ -166,10 +171,12 @@ def get_gene_details(gene_name, differential_results):
         if gene_col in ddtu_df.columns:
             gene_data = ddtu_df[ddtu_df[gene_col] == gene_name]
             if not gene_data.empty:
+                type_col = 'type' if 'type' in gene_data.columns else 'change'
+                significant = gene_data[gene_data[type_col] != 'notSig']
+                row = significant.iloc[0] if not significant.empty else gene_data.iloc[0]
                 details['DDTU'] = {
-                    'type': gene_data['type'].iloc[0] if 'type' in gene_data.columns else 
-                            (gene_data['change'].iloc[0] if 'change' in gene_data.columns else 'Unknown'),
-                    'transcript_id': gene_data['transcript_id'].iloc[0] if 'transcript_id' in gene_data.columns else 'Unknown'
+                    'type': row[type_col],
+                    'transcript_id': row['transcript_id'] if 'transcript_id' in gene_data.columns else 'Unknown'
                 }
     
     # DTE details
@@ -179,11 +186,13 @@ def get_gene_details(gene_name, differential_results):
         if gene_col in dte_df.columns:
             gene_data = dte_df[dte_df[gene_col] == gene_name]
             if not gene_data.empty:
+                type_col = 'change' if 'change' in gene_data.columns else 'type'
+                significant = gene_data[gene_data[type_col] != 'Stable']
+                row = significant.iloc[0] if not significant.empty else gene_data.iloc[0]
                 details['DTE'] = {
-                    'change': gene_data['change'].iloc[0] if 'change' in gene_data.columns else 
-                             (gene_data['type'].iloc[0] if 'type' in gene_data.columns else 'Unknown'),
-                    'avg_log2FC': float(gene_data['avg_log2FC'].iloc[0]) if 'avg_log2FC' in gene_data.columns else 0,
-                    'p_val_adj': float(gene_data['p_val_adj'].iloc[0]) if 'p_val_adj' in gene_data.columns else 1
+                    'change': row[type_col],
+                    'avg_log2FC': float(row['avg_log2FC']) if 'avg_log2FC' in gene_data.columns else 0,
+                    'p_val_adj': float(row['p_val_adj']) if 'p_val_adj' in gene_data.columns else 1
                 }
     
     # DGE details
@@ -193,11 +202,13 @@ def get_gene_details(gene_name, differential_results):
         if gene_col in dge_df.columns:
             gene_data = dge_df[dge_df[gene_col] == gene_name]
             if not gene_data.empty:
+                type_col = 'change' if 'change' in gene_data.columns else 'type'
+                significant = gene_data[gene_data[type_col] != 'Stable']
+                row = significant.iloc[0] if not significant.empty else gene_data.iloc[0]
                 details['DGE'] = {
-                    'change': gene_data['change'].iloc[0] if 'change' in gene_data.columns else 
-                             (gene_data['type'].iloc[0] if 'type' in gene_data.columns else 'Unknown'),
-                    'avg_log2FC': float(gene_data['avg_log2FC'].iloc[0]) if 'avg_log2FC' in gene_data.columns else 0,
-                    'p_val_adj': float(gene_data['p_val_adj'].iloc[0]) if 'p_val_adj' in gene_data.columns else 1
+                    'change': row[type_col],
+                    'avg_log2FC': float(row['avg_log2FC']) if 'avg_log2FC' in gene_data.columns else 0,
+                    'p_val_adj': float(row['p_val_adj']) if 'p_val_adj' in gene_data.columns else 1
                 }
     
     # DGU details
@@ -207,19 +218,21 @@ def get_gene_details(gene_name, differential_results):
         if gene_col in dgu_df.columns:
             gene_data = dgu_df[dgu_df[gene_col] == gene_name]
             if not gene_data.empty:
+                type_col = 'type' if 'type' in gene_data.columns else 'change'
+                significant = gene_data[gene_data[type_col] != 'notSig']
+                row = significant.iloc[0] if not significant.empty else gene_data.iloc[0]
                 details['DGU'] = {
-                    'type': gene_data['type'].iloc[0] if 'type' in gene_data.columns else 
-                           (gene_data['change'].iloc[0] if 'change' in gene_data.columns else 'Unknown'),
-                    'lgFC': float(gene_data['lgFC'].iloc[0]) if 'lgFC' in gene_data.columns else 0,
-                    'ident1_pct': float(gene_data['ident1_pct'].iloc[0]) if 'ident1_pct' in gene_data.columns else 0,
-                    'ident2_pct': float(gene_data['ident2_pct'].iloc[0]) if 'ident2_pct' in dgu_df.columns else 0
+                    'type': row[type_col],
+                    'lgFC': float(row['lgFC']) if 'lgFC' in gene_data.columns else 0,
+                    'ident1_pct': float(row['ident1_pct']) if 'ident1_pct' in gene_data.columns else 0,
+                    'ident2_pct': float(row['ident2_pct']) if 'ident2_pct' in gene_data.columns else 0
                 }
     
     return details
 
 def generate_prompt(intersection_genes, gene_details, study_description, comparison_name):
     """
-    Generate prompt for DeepSeek API
+    Generate a prompt for the configured LLM API
     
     Parameters:
     intersection_genes (list): List of genes in the intersection of all four analyses
@@ -232,7 +245,7 @@ def generate_prompt(intersection_genes, gene_details, study_description, compari
     """
     # Extract comparison groups
     if '_vs_' in comparison_name:
-        group1, group2 = comparison_name.split('_vs_')
+        group1, group2 = comparison_name.split('_vs_', 1)
     else:
         group1, group2 = "Condition1", "Condition2"
     
@@ -318,21 +331,19 @@ Please provide a detailed, well-organized response suitable for both biologists 
 """
     return prompt
 
-def call_deepseek_api(prompt, api_key, model="deepseek-chat"):
+def call_llm_api(prompt, client, model="deepseek-chat"):
     """
-    Call DeepSeek API for biological interpretation
+    Call an OpenAI-compatible API for biological interpretation
     
     Parameters:
     prompt (str): Prompt for the model
-    api_key (str): DeepSeek API key
+    client: Configured OpenAI-compatible client
     model (str): Model to use
     
     Returns:
     dict: API response and status
     """
     try:
-        client = OpenAI(api_key=api_key, base_url='https://api.deepseek.com')
-        
         response = client.chat.completions.create(
             model=model,
             messages=[
@@ -349,13 +360,13 @@ def call_deepseek_api(prompt, api_key, model="deepseek-chat"):
             max_tokens=3000
         )
         
-        interpretation = response.choices[0].message.content
+        interpretation = response_text(response)
         
         return {
             'status': 'success',
             'interpretation': interpretation,
             'model': model,
-            'tokens_used': response.usage.total_tokens if hasattr(response, 'usage') else 'unknown'
+            'tokens_used': response_total_tokens(response)
         }
         
     except Exception as e:
@@ -366,7 +377,7 @@ def call_deepseek_api(prompt, api_key, model="deepseek-chat"):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Generate biological interpretation for genes in intersection of all four differential analyses using DeepSeek API'
+        description='Generate biological interpretation for genes shared by four analyses using an OpenAI-compatible API'
     )
     
     # Required arguments
@@ -380,28 +391,16 @@ def main():
                        help='Path to save the API response details')
     
     # Optional arguments
-    parser.add_argument('--api_key', default='',
-                       help='DeepSeek API key (required for API-based interpretation)')
     parser.add_argument('--study_description', default='',
                        help='Study context description')
-    parser.add_argument('--model', default='deepseek-chat',
-                       help='DeepSeek model to use (default: deepseek-reasoner)')
+    add_llm_arguments(parser, default_model='deepseek-chat')
     
     args = parser.parse_args()
     
-    # Check if API key is provided
-    if not args.api_key or args.api_key == '':
-        print("ERROR: DeepSeek API key is not provided. Please set --api_key parameter.")
-        with open(args.output_report, 'w') as f:
-            f.write("Differential analysis interpretation skipped: API key not provided.\n")
-            f.write("To generate biological interpretation, please provide a DeepSeek API key.\n")
-        with open(args.output_api, 'w') as f:
-            f.write(json.dumps({
-                'status': 'skipped',
-                'message': 'API key not provided',
-                'timestamp': datetime.now().isoformat()
-            }, indent=2))
-        sys.exit(0)
+    try:
+        client = client_from_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     
     # Set default study description if not provided
     if not args.study_description:
@@ -445,6 +444,11 @@ exploring disease-associated molecular changes at multiple levels."""
                 'individual_counts': {k: len(v) for k, v in gene_sets.items()},
                 'timestamp': datetime.now().isoformat()
             }, indent=2))
+        summary_file = args.output_report.replace('.txt', '_summary.txt')
+        with open(summary_file, 'w') as f:
+            f.write("No genes were shared by all four differential analyses.\n")
+            for analysis, gene_set in sorted(gene_sets.items()):
+                f.write(f"{analysis}: {len(gene_set)} significant genes\n")
         sys.exit(0)
     
     print(f"\nFound {len(intersection_genes)} genes in intersection of all four analyses:")
@@ -458,7 +462,7 @@ exploring disease-associated molecular changes at multiple levels."""
         gene_details[gene] = get_gene_details(gene, differential_results)
     
     # Generate prompt
-    print("Generating prompt for DeepSeek API...")
+    print("Generating prompt for LLM API...")
     prompt = generate_prompt(intersection_genes, gene_details, args.study_description, args.comparison_name)
     
     # Save prompt for debugging
@@ -467,9 +471,9 @@ exploring disease-associated molecular changes at multiple levels."""
         f.write(prompt)
     print(f"Prompt saved to: {prompt_file}")
     
-    # Call DeepSeek API
-    print("\nCalling DeepSeek API...")
-    api_result = call_deepseek_api(prompt, args.api_key, args.model)
+    # Call the configured LLM API.
+    print("\nCalling LLM API...")
+    api_result = call_llm_api(prompt, client, args.model)
     
     if api_result['status'] == 'success':
         interpretation = api_result['interpretation']

@@ -12,6 +12,7 @@ process SPLIT_EXPRESSION {
   
   input:
     path seurat_rds
+    path pipeline_bin
   
   output:
     path "split_files/*.txt", emit: split_files 
@@ -22,8 +23,8 @@ process SPLIT_EXPRESSION {
     # Create output directory
     mkdir -p split_files
     
-    RSCRIPT_PATH="${projectDir}/bin/AlternativeSplicing/split_expression.R"
-    Rscript \${RSCRIPT_PATH} \
+    RSCRIPT_PATH="${pipeline_bin}/AlternativeSplicing/split_expression.R"
+    "${params.rscript_bin ?: 'Rscript'}" "\${RSCRIPT_PATH}" \
       --seurat_file "${seurat_rds}" \
       --split_size ${params.split_size ?: 100} \
       --output_dir "split_files"
@@ -71,7 +72,8 @@ process GENERATE_AS_EVENTS {
     exit 1
   fi
 
-  awk 'FNR==1 && NR!=1 { while (/^<header>/) getline; } 1 {print}' *.ioe > merged_events.ioe
+  # SUPPA writes the same header to every IOE file. Keep it only once.
+  awk 'FNR == 1 && NR != 1 { next } { print }' *.ioe > merged_events.ioe
 
   if [[ ! -s "merged_events.ioe" ]]; then
     echo "ERROR: Failed to create merged events file" >&2
@@ -131,7 +133,7 @@ process MERGE_AS_RESULTS {
   
   script:
     """
-    #!/usr/bin/env Rscript
+    "${params.rscript_bin ?: 'Rscript'}" --vanilla - << 'RSCRIPT'
     
 
     library(data.table)
@@ -152,8 +154,10 @@ process MERGE_AS_RESULTS {
     colnames(merged_dt)[1] <- "ASE"
     
 
-    for (j in seq_len(ncol(merged_dt))) {
-        set(merged_dt, which(is.na(merged_dt[[j]])), j, 0)
+    if (ncol(merged_dt) > 1) {
+        for (j in seq.int(2, ncol(merged_dt))) {
+            set(merged_dt, which(is.na(merged_dt[[j]])), j, 0)
+        }
     }
     
    
@@ -169,10 +173,16 @@ process MERGE_AS_RESULTS {
             if (nrow(dt) != nrow(merged_dt)) {
                 stop(paste("Error: Row count mismatch in file:", f))
             }
+
+            if (!identical(dt[[1]], merged_dt[["ASE"]])) {
+                stop(paste("Error: ASE row order mismatch in file:", f))
+            }
             
 
-            for (j in seq_len(ncol(dt))) {
-                set(dt, which(is.na(dt[[j]])), j, 0)
+            if (ncol(dt) > 1) {
+                for (j in seq.int(2, ncol(dt))) {
+                    set(dt, which(is.na(dt[[j]])), j, 0)
+                }
             }
             
 
@@ -186,6 +196,7 @@ process MERGE_AS_RESULTS {
     message("Writing merged output...")
     fwrite(merged_dt, "merged_project_events.psi", sep = "\\t", quote = FALSE, row.names = FALSE)
     message("Done.")
+    RSCRIPT
     """
 }
 
@@ -199,7 +210,8 @@ process ASE_ANALYSIS {
     path merged_psi
     path merged_events
     path seurat_rds
-    path novel_vs_known
+    path isoquant_dir
+    path pipeline_bin
   
   output:
     path "ase_analysis_output/*", emit: analysis_results
@@ -212,13 +224,19 @@ process ASE_ANALYSIS {
     mkdir -p ${output_dir}
     
     # Run ASE analysis with optparse
-    RSCRIPT_PATH="${projectDir}/bin/AlternativeSplicing/AsEventAnalysis.R"
+    NOVEL_VS_KNOWN="${isoquant_dir}/OUT/OUT.novel_vs_known.SQANTI-like.tsv"
+    if [[ ! -f "\${NOVEL_VS_KNOWN}" ]]; then
+      echo "ERROR: Novel-vs-known annotation not found: \${NOVEL_VS_KNOWN}" >&2
+      exit 1
+    fi
+
+    RSCRIPT_PATH="${pipeline_bin}/AlternativeSplicing/AsEventAnalysis.R"
     
-    Rscript \${RSCRIPT_PATH} \
+    "${params.rscript_bin ?: 'Rscript'}" "\${RSCRIPT_PATH}" \
       --psi_file "${merged_psi}" \
       --ioe_file "${merged_events}" \
       --seurat_rds "${seurat_rds}" \
-      --novel_vs_known "${novel_vs_known}" \
+      --novel_vs_known "\${NOVEL_VS_KNOWN}" \
       --output_dir "${output_dir}" \
       --min_cell_prop ${params.ase_min_cell_prop ?: 0.01}
     
@@ -230,7 +248,7 @@ process ASE_ANALYSIS {
     echo "- PSI file: ${merged_psi}" >> ase_analysis_summary.txt
     echo "- Events file: ${merged_events}" >> ase_analysis_summary.txt
     echo "- Seurat object: ${seurat_rds}" >> ase_analysis_summary.txt
-    echo "- Novel vs Known: ${novel_vs_known}" >> ase_analysis_summary.txt
+    echo "- Novel vs Known: \${NOVEL_VS_KNOWN}" >> ase_analysis_summary.txt
     echo "" >> ase_analysis_summary.txt
     echo "Output generated in: ${output_dir}" >> ase_analysis_summary.txt
     echo "Number of plots generated: \$(find ${output_dir} -name '*.pdf' | wc -l)" >> ase_analysis_summary.txt
@@ -246,6 +264,7 @@ process DOMINANT_ISOFORM_DETECTION {
   input:
     path seurat_rds
     path transcript_gtf
+    path pipeline_bin
   
   output:
     path "dominant_isoform_output", emit: analysis_results_dir
@@ -288,13 +307,14 @@ ${comparisons_content}
 EOF
     
     # Run dominant isoform analysis
-    RSCRIPT_PATH="${projectDir}/bin/AlternativeSplicing/dominant_isoform_detection.R"
+    RSCRIPT_PATH="${pipeline_bin}/AlternativeSplicing/dominant_isoform_detection.R"
     
     # Pass the absolute path to R script
-    Rscript \${RSCRIPT_PATH} \\
+    "${params.rscript_bin ?: 'Rscript'}" "\${RSCRIPT_PATH}" \\
       --seurat_rds "${seurat_rds}" \\
       --gtf_file "${gtf_path}" \\
       --stage_mapping "${stage_mapping_file}" \\
+      --comparisons "${comparisons_file}" \\
       --output_dir "${output_dir}" \\
       --min_cells ${params.dominant_min_cells ?: 10} \\
       --n_cores ${params.dominant_n_cores ?: 15} \\
@@ -329,10 +349,11 @@ process ISOFORM_SWITCH_PREPARATION {
     path seurat_gene
     path transcript_gtf
     path transcript_fasta
+    path pipeline_bin
   
   output:
     path "isoform_switch_prep_output/*", emit: preparation_results
-    path "switchList_prep.rds", emit: switchlist_rds
+    path "switchList_prep.rds", optional: true, emit: switchlist_rds
     path "preparation_summary.txt", emit: prep_summary
   
   script:
@@ -355,6 +376,8 @@ process ISOFORM_SWITCH_PREPARATION {
     // Get comparison from config
     comparisons = params.comparisons 
     comparison = comparisons[0]  // Use first comparison
+    comparison_group1 = comparison[0]
+    comparison_group2 = comparison[1]
     comparison_name = comparison[2]
     
     // Get external tool result files (empty string if not provided)
@@ -374,9 +397,9 @@ ${stage_mapping_content}
 EOF
     
     # Run isoform switch preparation
-    RSCRIPT_PATH="${projectDir}/bin/AlternativeSplicing/isoform_switch_preparation.R"
+    RSCRIPT_PATH="${pipeline_bin}/AlternativeSplicing/isoform_switch_preparation.R"
     
-    Rscript \${RSCRIPT_PATH} \\
+    "${params.rscript_bin ?: 'Rscript'}" "\${RSCRIPT_PATH}" \\
       --dominant_results "${dominant_dir}" \\
       --seurat_rds "${seurat_tr_path}" \\
       --seurat_gene_rds "${seurat_gene_path}" \\
@@ -385,6 +408,8 @@ EOF
       --output_dir "${output_dir}" \\
       --stage_mapping "${stage_mapping_file}" \\
       --comparison "${comparison_name}" \\
+      --reference_group "${comparison_group1}" \\
+      --test_group "${comparison_group2}" \\
       --cpc2_result "${cpc2_result}" \\
       --pfam_result "${pfam_result}" \\
       --signalp_result "${signalp_result}" \\
@@ -409,6 +434,7 @@ EOF
     echo "" >> preparation_summary.txt
     echo "Parameters:" >> preparation_summary.txt
     echo "- Comparison: ${comparison_name}" >> preparation_summary.txt
+    echo "- Groups: ${comparison_group1} vs ${comparison_group2}" >> preparation_summary.txt
     echo "- Number of cores: ${params.isoform_n_cores ?: 15}" >> preparation_summary.txt
     echo "- dIF cutoff: ${params.isoform_dIF_cutoff ?: 0.1}" >> preparation_summary.txt
     echo "- Alpha: ${params.isoform_alpha ?: 0.05}" >> preparation_summary.txt
@@ -425,6 +451,7 @@ process ISOFORM_SWITCH_CONSEQUENCES {
   
   input:
     path switchlist_rds
+    path pipeline_bin
   
   output:
     path "isoform_switch_conseq_output/", emit: consequences_results
@@ -441,9 +468,9 @@ process ISOFORM_SWITCH_CONSEQUENCES {
     mkdir -p ${output_dir}
     
     # Run consequences analysis
-    RSCRIPT_PATH="${projectDir}/bin/AlternativeSplicing/isoform_switch_consequences.R"
+    RSCRIPT_PATH="${pipeline_bin}/AlternativeSplicing/isoform_switch_consequences.R"
     
-    Rscript \${RSCRIPT_PATH} \\
+    "${params.rscript_bin ?: 'Rscript'}" "\${RSCRIPT_PATH}" \\
       --switchlist_file "${switchlist_path}" \\
       --output_dir "${output_dir}" \\
       --dIF_cutoff ${params.isoform_dIF_cutoff ?: 0.1} \\
@@ -464,23 +491,24 @@ process ISOFORM_SWITCH_CONSEQUENCES {
 }
 
 
-process ISOFORM_SWITCH_BIOLOGICAL_INTERPRETATION {
+process LLM_ISOFORM_SWITCH_INTERPRETATION {
   label 'sclong'
-  tag "biological_interpretation"
+  tag "llm_isoform_switch_interpretation"
   
   publishDir "${params.outdir ?: 'Result'}/AlternativeSplicing/IsoformSwitch/interpretation", mode: 'copy'
   
-  // Only run when API key is provided
-  when:
-    params.api_key && params.api_key != '' && params.api_key != '""'
-  
   input:
     path consequences_results_dir
+    path pipeline_bin
   
   output:
     path "biological_interpretation.txt", emit: interpretation_report
+    // Historical filename retained for backward compatibility.
     path "deepseek_api_response.json", emit: api_response
     path "gene_summary.txt", emit: gene_summary
+
+  when:
+    params.llm_enabled
   
   script:
     // Find the switch_consequences.txt file in the input directory
@@ -489,39 +517,23 @@ process ISOFORM_SWITCH_BIOLOGICAL_INTERPRETATION {
     // Set study description
     def study_description = params.study_description 
     
-    // Get API parameters
-    def api_key = params.api_key ?: ''
-    def model = params.deepseek_model ?: 'deepseek-reasoner'
-    
     """
-    # Check if API key is provided
-    if [[ -z "${api_key}" ]] || [[ "${api_key}" == "" ]]; then
-      echo "Isoform switch biological interpretation skipped: API key not configured" >&2
-      touch biological_interpretation.txt
-      echo "No API key provided, skipping DeepSeek biological interpretation" > biological_interpretation.txt
-      touch deepseek_api_response.json
-      echo '{"status": "skipped", "message": "API key not provided"}' > deepseek_api_response.json
-      touch gene_summary.txt
-      echo "Gene summary not generated due to missing API key" > gene_summary.txt
-      exit 0
-    fi
-    
     # Check if consequences file exists
     if [[ ! -f "${consequences_file}" ]]; then
       echo "ERROR: Consequences file not found: ${consequences_file}" >&2
       exit 1
     fi
     
-    # Run the DeepSeek interpretation script
-    PYTHON_SCRIPT="${projectDir}/bin/deepseek/isoform_switch_interpretation.py"
+    # Run the provider-agnostic interpretation script.
+    PYTHON_SCRIPT="${pipeline_bin}/llm/isoform_switch_interpretation.py"
     
     python3 \${PYTHON_SCRIPT} \
       --consequences_file "${consequences_file}" \
       --output_report "biological_interpretation.txt" \
       --output_api "deepseek_api_response.json" \
-      --api_key "${api_key}" \
       --study_description "${study_description}" \
-      --model "${model}" \
+      --base_url "${params.llm_base_url}" \
+      --model "${params.llm_model}" \
       --save_prompt
     
     # Check if report was generated
@@ -544,10 +556,12 @@ workflow AlternativeSplicing {
     isoquant_out
   
   main:
+    pipeline_bin = file("${projectDir}/bin", checkIfExists: true)
+
     // ------------------------------------------------------------------
     // Part 1: Alternative Splicing Event Detection
     // ------------------------------------------------------------------
-    split_results = SPLIT_EXPRESSION(seurat_tr)
+    split_results = SPLIT_EXPRESSION(seurat_tr, pipeline_bin)
     events_results = GENERATE_AS_EVENTS(gtf_file)
     split_files_channel = split_results.split_files.flatten()
     psi_results = CALCULATE_PSI(events_results.merged_events, split_files_channel)
@@ -557,14 +571,12 @@ workflow AlternativeSplicing {
     // ------------------------------------------------------------------
     // Part 2: ASE Analysis
     // ------------------------------------------------------------------
-    def novel_vs_known_path = "${isoquant_out.toString()}/OUT/OUT.novel_vs_known.SQANTI-like.tsv"
-    def novel_vs_known_file = file(novel_vs_known_path)
-    
     ase_analysis = ASE_ANALYSIS(
       merge_results.merged_psi,
       events_results.merged_events,
       seurat_tr,
-      novel_vs_known_file
+      isoquant_out,
+      pipeline_bin
     )
     
     // ------------------------------------------------------------------
@@ -573,7 +585,8 @@ workflow AlternativeSplicing {
     
     dominant_isoform = DOMINANT_ISOFORM_DETECTION(
       seurat_tr,
-      gtf_file
+      gtf_file,
+      pipeline_bin
     )
     
     // ------------------------------------------------------------------
@@ -587,17 +600,20 @@ workflow AlternativeSplicing {
       seurat_tr,
       seurat_gene,
       gtf_file,
-      transcript_fasta
+      transcript_fasta,
+      pipeline_bin
     )
     
     // 4b: Consequences phase
     isoform_switch_conseq = ISOFORM_SWITCH_CONSEQUENCES(
-      isoform_switch_prep.switchlist_rds
+      isoform_switch_prep.switchlist_rds,
+      pipeline_bin
     )
 
-    // 4c: Biological interpretation phase (only when API key is provided)
-    biological_interpretation = ISOFORM_SWITCH_BIOLOGICAL_INTERPRETATION(
-      isoform_switch_conseq.consequences_results
+    // 4c: Optional provider-agnostic LLM interpretation.
+    biological_interpretation = LLM_ISOFORM_SWITCH_INTERPRETATION(
+      isoform_switch_conseq.consequences_results,
+      pipeline_bin
     )
   
   emit:

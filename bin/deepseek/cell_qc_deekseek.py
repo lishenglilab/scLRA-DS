@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""
-Single-cell QC analysis using DeepSeek API
-Analyzes single-cell RNA-seq QC metrics and generates quality control report
-"""
+"""Single-cell QC reporting through an OpenAI-compatible LLM endpoint."""
 
 import pandas as pd
-import numpy as np
-from openai import OpenAI
 import argparse
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from llm.client import add_llm_arguments, client_from_args, response_text
 
 def generate_qc_report(args):
     """
-    Generate a quality control report for single-cell RNA-seq data using DeepSeek API.
+    Generate a quality control report for single-cell RNA-seq data.
     
     Parameters:
     args (Namespace): The arguments passed from the command line.
@@ -20,13 +19,15 @@ def generate_qc_report(args):
     Returns:
     str: The content of the generated QC report.
     """
-    client = OpenAI(api_key=args.api_key, base_url='https://api.deepseek.com')
+    client = client_from_args(args)
 
     # Read the CSV/TSV file containing the QC data
     if args.csv_file_path.endswith('.tsv'):
         df = pd.read_csv(args.csv_file_path, sep='\t')
     else:
         df = pd.read_csv(args.csv_file_path)
+    if df.empty:
+        raise ValueError("QC metrics input does not contain any data rows")
     
     # Debug: print the columns to verify
     print(f"DataFrame columns: {df.columns.tolist()}")
@@ -154,7 +155,7 @@ Provide a comprehensive but concise report suitable for researchers, including s
     # Create the messages to send to the API
     messages = [{"role": "system", "content": system_prompt}]
     
-    # Call the DeepSeek API to generate the report
+    # Call the configured OpenAI-compatible API to generate the report.
     try:
         completion = client.chat.completions.create(
             model=args.model,
@@ -162,7 +163,7 @@ Provide a comprehensive but concise report suitable for researchers, including s
         )
 
         # Get the response content from the model
-        response_content = completion.choices[0].message.content
+        response_content = response_text(completion)
         
         # Save the result to the output text file
         with open(args.output_text_file, 'w') as f:
@@ -173,9 +174,9 @@ Provide a comprehensive but concise report suitable for researchers, including s
         return response_content
     
     except Exception as e:
-        print(f"Error calling DeepSeek API: {e}")
+        print(f"Error calling LLM API: {e}")
         # Create a basic error report
-        error_report = f"Failed to generate QC report via DeepSeek API.\nError: {str(e)}\n\nPlease check your API key and internet connection."
+        error_report = f"Failed to generate QC report via the configured LLM API.\nError: {str(e)}\n\nPlease check the endpoint, API key, and network connection."
         with open(args.output_text_file, 'w') as f:
             f.write(error_report)
         return error_report
@@ -187,20 +188,14 @@ def main():
     
     # Arguments
     parser.add_argument('--csv_file_path', required=True, help='Path to the CSV/TSV file containing QC data')
-    parser.add_argument('--api_key', required=True, help='DeepSeek API key')
-    parser.add_argument('--model', default="deepseek-reasoner", help='The model to use, default is "deepseek-reasoner"')
     parser.add_argument('--output_text_file', required=True, help='Path to save the output QC report')
     parser.add_argument('--species', default="Human", help='The species of the sample (default: Human)')
     parser.add_argument('--tissue', default="Skin", help='The tissue type of the sample (default: Skin)')
+    add_llm_arguments(parser)
     
     # Parse the arguments
     args = parser.parse_args()
 
-    # Check if API key is provided
-    if not args.api_key or args.api_key == "":
-        print("ERROR: API key is required")
-        sys.exit(1)
-    
     # Check if input file exists
     import os
     if not os.path.exists(args.csv_file_path):
@@ -208,7 +203,10 @@ def main():
         sys.exit(1)
     
     # Generate the QC report
-    generate_qc_report(args)
+    try:
+        generate_qc_report(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
 
 if __name__ == '__main__':

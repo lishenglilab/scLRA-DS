@@ -1,0 +1,13 @@
+.nextflow*
+.conda/
+work/
+results/
+nextflow.tar.gz
+assets/3M-february-2018.txt
+
+__pycache__/
+*.py[cod]
+
+.env
+.env.*
+!.env.example

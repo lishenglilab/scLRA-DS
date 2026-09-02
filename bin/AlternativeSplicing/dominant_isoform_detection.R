@@ -255,7 +255,7 @@ meta$cell_id <- rownames(meta)
 
 
 # Extract sample name from cell_id (remove suffix after underscore)
-meta$sample <- gsub("_.*", "", meta$cell_id)
+meta$sample <- sub("_[^_]+$", "", meta$cell_id)
 
 # Load stage mapping if provided
 if (!is.null(stage_mapping_file) && file.exists(stage_mapping_file)) {
@@ -300,6 +300,9 @@ if (!is.null(comparisons_file) && file.exists(comparisons_file)) {
   if (!all(c("group1", "group2", "name") %in% colnames(comparisons_df))) {
     stop("Comparisons file must contain 'group1', 'group2', and 'name' columns")
   }
+  if (nrow(comparisons_df) == 0) {
+    stop("Comparisons file does not contain any comparison rows")
+  }
   
   # Validate comparisons
   valid_comparisons <- list()
@@ -312,8 +315,11 @@ if (!is.null(comparisons_file) && file.exists(comparisons_file)) {
       valid_comparisons[[name]] <- list(group1 = group1, group2 = group2)
       log_message(paste("Valid comparison:", name, "(", group1, "vs", group2, ")"))
     } else {
-      log_message(paste("Warning: Comparison", name, "(", group1, "vs", group2, 
-                        ") contains invalid stage groups. Skipping."))
+      stop(paste(
+        "Comparison", name, "(", group1, "vs", group2,
+        ") contains a group absent from the stage mapping. Available groups:",
+        paste(all_stages, collapse = ", ")
+      ))
     }
   }
 } else {
@@ -338,7 +344,7 @@ if (!is.null(comparisons_file) && file.exists(comparisons_file)) {
 
 # Exit if no valid comparisons
 if (length(valid_comparisons) == 0) {
-  log_message("No valid comparisons to analyze. Exiting comparison step.")
+  stop("No valid comparisons to analyze")
 } else {
   # ----------------------------------------------------------------------
   # Part 5: Calculate transcript usage percentages for all comparisons

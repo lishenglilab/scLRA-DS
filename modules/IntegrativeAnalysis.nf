@@ -22,9 +22,10 @@ process CREATE_STAGE_MAPPING_FILE {
     # Create stage mapping file
     echo -e "sample\\tstage" > sample_stage_mapping.tsv
     
-    # Add each mapping entry - use double quotes to allow variable expansion
-    # The stage_mapping_list already contains formatted lines with sample and stage
-    echo "${stage_mapping_list}" >> sample_stage_mapping.tsv
+    # Add the preformatted mappings without shell expansion.
+    cat << 'STAGE_MAPPING_EOF' >> sample_stage_mapping.tsv
+${stage_mapping_list}
+STAGE_MAPPING_EOF
     
     echo "Stage mapping file created with \$(wc -l sample_stage_mapping.tsv) entries"
     """
@@ -42,13 +43,12 @@ process DIFFERENTIAL_ANALYSIS {
     path gtf_file
     path dominant_results_dir
     path stage_mapping_file
-    val ident_1
-    val ident_2
-    val comparison_name
+    tuple val(ident_1), val(ident_2), val(comparison_name)
+    path pipeline_bin
   
   output:
-    path "${comparison_name}/", emit: analysis_results
-    path "${comparison_name}_summary.txt", emit: analysis_summary
+    tuple val(comparison_name), path("${comparison_name}/"), emit: analysis_results
+    tuple val(comparison_name), path("${comparison_name}_summary.txt"), emit: analysis_summary
   
   script:
     // Create output directory for this comparison
@@ -65,9 +65,9 @@ process DIFFERENTIAL_ANALYSIS {
     mkdir -p ${output_dir}
     
     # Run differential analysis
-    RSCRIPT_PATH="${projectDir}/bin/IntegrativeAnalysis/differential_analysis.R"
+    RSCRIPT_PATH="${pipeline_bin}/IntegrativeAnalysis/differential_analysis.R"
     
-    Rscript \${RSCRIPT_PATH} \
+    "${params.rscript_bin ?: 'Rscript'}" "\${RSCRIPT_PATH}" \
       --seurat_tr_rds "${seurat_tr}" \
       --seurat_gene_rds "${seurat_gene}" \
       --gtf_file "${gtf_file}" \
@@ -95,67 +95,51 @@ process DIFFERENTIAL_ANALYSIS {
     echo "" >> ${comparison_name}_summary.txt
     echo "Output files generated in: ${output_dir}" >> ${comparison_name}_summary.txt
     echo "Generated files:" >> ${comparison_name}_summary.txt
-    find ${output_dir} -type f -name "*.txt" -o -name "*.pdf" -o -name "*.png" -o -name "*.rds" | sort >> ${comparison_name}_summary.txt
+    find "${output_dir}" -type f | sort >> "${comparison_name}_summary.txt"
     """
 }
 
-process DIFFERENTIAL_INTERPRETATION {
+process LLM_DIFFERENTIAL_INTERPRETATION {
   label 'sclong'
-  tag { comparison_name }
+  tag { "llm_${comparison_name}" }
   
   publishDir "${params.outdir ?: 'Result'}/IntegrativeAnalysis/${comparison_name}/interpretation", mode: 'copy'
   
-  // Only run when API key is provided
-  when:
-    params.api_key && params.api_key != '' && params.api_key != '""'
-  
   input:
-    path analysis_results_dir
-    val comparison_name
+    tuple val(comparison_name), path(analysis_results_dir)
+    path pipeline_bin
   
   output:
-    path "differential_interpretation.txt", emit: interpretation_report
-    path "deepseek_differential_response.json", emit: api_response
-    path "differential_interpretation_summary.txt", emit: gene_summary
+    tuple val(comparison_name), path("differential_interpretation.txt"), emit: interpretation_report
+    // Historical filename retained for backward compatibility.
+    tuple val(comparison_name), path("deepseek_differential_response.json"), emit: api_response
+    tuple val(comparison_name), path("differential_interpretation_summary.txt"), emit: gene_summary
+
+  when:
+    params.llm_enabled
   
   script:
     // Set study description
     def study_description = params.study_description 
     
-    // Get API parameters
-    def api_key = params.api_key ?: ''
-    def model = params.deepseek_model ?: 'deepseek-reasoner'
-    
     """
-    # Check if API key is provided
-    if [[ -z "${api_key}" ]] || [[ "${api_key}" == "" ]]; then
-      echo "Differential analysis biological interpretation skipped: API key not configured" >&2
-      touch differential_interpretation.txt
-      echo "No API key provided, skipping DeepSeek differential interpretation" > differential_interpretation.txt
-      touch deepseek_differential_response.json
-      echo '{"status": "skipped", "message": "API key not provided"}' > deepseek_differential_response.json
-      touch differential_genes_summary.txt
-      echo "Gene summary not generated due to missing API key" > differential_genes_summary.txt
-      exit 0
-    fi
-    
     # Check if analysis results exist
     if [[ ! -d "${analysis_results_dir}" ]]; then
       echo "ERROR: Analysis results directory not found: ${analysis_results_dir}" >&2
       exit 1
     fi
     
-    # Run the DeepSeek interpretation script
-    PYTHON_SCRIPT="${projectDir}/bin/deepseek/differential_interpretation.py"
+    # Run the provider-agnostic interpretation script.
+    PYTHON_SCRIPT="${pipeline_bin}/llm/differential_interpretation.py"
     
     python3 \${PYTHON_SCRIPT} \
       --result_dir "${analysis_results_dir}" \
       --comparison_name "${comparison_name}" \
       --output_report "differential_interpretation.txt" \
       --output_api "deepseek_differential_response.json" \
-      --api_key "${api_key}" \
       --study_description "${study_description}" \
-      --model "${model}"
+      --base_url "${params.llm_base_url}" \
+      --model "${params.llm_model}"
     
     # Check if report was generated
     if [[ ! -s "differential_interpretation.txt" ]]; then
@@ -180,6 +164,7 @@ process ORF_CLUSTER {
     path gtf_file
     val resolution
     val dims
+    path pipeline_bin
   
   output:
     path "ORF_Cluster", emit: orf_cluster_results
@@ -197,7 +182,7 @@ process ORF_CLUSTER {
     mkdir -p ${output_dir}
     
     # Run ORF clustering analysis
-    RSCRIPT_PATH="${projectDir}/bin/IntegrativeAnalysis/orf_cluster.R"
+    RSCRIPT_PATH="${pipeline_bin}/IntegrativeAnalysis/orf_cluster.R"
     
     # Check if R script exists
     if [ ! -f "\${RSCRIPT_PATH}" ]; then
@@ -205,7 +190,7 @@ process ORF_CLUSTER {
       exit 1
     fi
     
-    Rscript \${RSCRIPT_PATH} \
+    "${params.rscript_bin ?: 'Rscript'}" "\${RSCRIPT_PATH}" \
       --seurat_rds "${seurat_tr}" \
       --orf_fasta "${orf_fasta}" \
       --gtf_file "${gtf_file}" \
@@ -260,6 +245,8 @@ workflow IntegrativeAnalysis {
     orf_fasta  // Add orf_fasta as input parameter
   
   main:
+    pipeline_bin = file("${projectDir}/bin", checkIfExists: true)
+
     // Get comparisons from config
     def comparisons = params.comparisons ?: [
       ["AD", "Normal", "AD_vs_Normal"]
@@ -273,47 +260,51 @@ workflow IntegrativeAnalysis {
     
     // Create stage mapping file
     stage_mapping = CREATE_STAGE_MAPPING_FILE(stage_mapping_content.toString())
+
+    // These singleton upstream outputs are value channels. The comparisons
+    // channel is the only queue input, so DIFFERENTIAL_ANALYSIS runs once per
+    // configured comparison without invoking a process from a closure.
+    seurat_tr_value = seurat_tr
+    seurat_gene_value = seurat_gene
+    gtf_file_value = gtf_file
+    dominant_results_value = dominant_results
+    orf_fasta_value = orf_fasta
+    stage_mapping_value = stage_mapping.stage_mapping_file
+
+    comparison_ch = channel
+      .fromList(comparisons)
+      .map { comparison ->
+        if (!(comparison instanceof List) || comparison.size() != 3) {
+          error "Each params.comparisons entry must be [group1, group2, name]: ${comparison}"
+        }
+        tuple(comparison[0], comparison[1], comparison[2])
+      }
     
     // Run ORF clustering analysis
     orf_cluster_results = ORF_CLUSTER(
-      seurat_tr,
-      orf_fasta,  // Use the input parameter
-      gtf_file,
+      seurat_tr_value,
+      orf_fasta_value,
+      gtf_file_value,
       params.orf_resolution ?: 0.4,
-      params.orf_dims ?: "1:30"
+      params.orf_dims ?: "1:30",
+      pipeline_bin
     )
-    
-    // Process each comparison
-    diff_analysis_results = []
-    differential_interpretation_results = []
-    
-    comparisons.each { comparison ->
-      def ident_1 = comparison[0]
-      def ident_2 = comparison[1]
-      def comparison_name = comparison[2]
-      
-      // Run differential analysis
-      diff_results = DIFFERENTIAL_ANALYSIS(
-        seurat_tr,
-        seurat_gene,
-        gtf_file,
-        dominant_results,
-        stage_mapping.stage_mapping_file,
-        ident_1,
-        ident_2,
-        comparison_name
-      )
-      
-      diff_analysis_results.add(diff_results)
-      
-      // Run differential interpretation (if API key is provided)
-      diff_interpretation = DIFFERENTIAL_INTERPRETATION(
-        diff_results.analysis_results,
-        comparison_name
-      )
-      
-      differential_interpretation_results.add(diff_interpretation)
-    }
+
+    diff_results = DIFFERENTIAL_ANALYSIS(
+      seurat_tr_value,
+      seurat_gene_value,
+      gtf_file_value,
+      dominant_results_value,
+      stage_mapping_value,
+      comparison_ch,
+      pipeline_bin
+    )
+
+    // Optional interpretation consumes the keyed result tuples once.
+    LLM_DIFFERENTIAL_INTERPRETATION(
+      diff_results.analysis_results,
+      pipeline_bin
+    )
   
   emit:
     // Stage mapping file
@@ -323,5 +314,5 @@ workflow IntegrativeAnalysis {
     orf_cluster = orf_cluster_results.orf_cluster_results
     
     // Differential analysis results
-    diff_analysis_results = diff_analysis_results.analysis_results
+    diff_analysis_results = diff_results.analysis_results.map { _comparison_name, result_dir -> result_dir }
 }

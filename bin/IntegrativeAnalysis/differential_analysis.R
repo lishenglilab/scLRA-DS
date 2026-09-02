@@ -39,7 +39,12 @@ required_args <- c("seurat_tr_rds", "seurat_gene_rds", "gtf_file",
                    "logfc_threshold", "pval_threshold", "min_pct", "n_cores",
                    "stage_mapping_file")
 
-missing_args <- required_args[!required_args %in% names(opt)]
+missing_args <- required_args[vapply(
+  required_args,
+  function(name) is.null(opt[[name]]) || length(opt[[name]]) == 0 ||
+    (is.character(opt[[name]]) && !nzchar(opt[[name]])),
+  logical(1)
+)]
 if (length(missing_args) > 0) {
   stop(paste("Missing required arguments:", paste(missing_args, collapse=", ")))
 }
@@ -50,7 +55,7 @@ if (!dir.exists(opt$output_dir)) {
 }
 
 # Set parallel options
-options(future.globals.maxSize = 80000000 * 1024^2)
+options(future.globals.maxSize = 80 * 1024^3)
 plan('multisession', workers = opt$n_cores)
 
 # ------------------------------------------------------------------
@@ -130,7 +135,7 @@ sce.tr <- readRDS(opt$seurat_tr_rds)
 cat("Adding stage information to Seurat transcript object...\n")
 # Extract sample name from cell barcode (assuming format: SAMPLE_CELLBARCODE)
 cell_barcodes <- colnames(sce.tr)
-sample_names <- sapply(strsplit(cell_barcodes, "_"), `[`, 1)
+sample_names <- sub("_[^_]+$", "", cell_barcodes)
 
 # Map sample names to stage using stage_mapping
 if (all(sample_names %in% stage_mapping$sample)) {
@@ -196,7 +201,7 @@ sce.gene <- readRDS(opt$seurat_gene_rds)
 cat("Adding stage information to Seurat gene object...\n")
 # Extract sample name from cell barcode (assuming format: SAMPLE_CELLBARCODE)
 cell_barcodes <- colnames(sce.gene)
-sample_names <- sapply(strsplit(cell_barcodes, "_"), `[`, 1)
+sample_names <- sub("_[^_]+$", "", cell_barcodes)
 
 # Map sample names to stage using stage_mapping
 if (all(sample_names %in% stage_mapping$sample)) {
@@ -349,11 +354,11 @@ summary_stats <- data.frame(
                         length(DTE_gene),
                         length(DGE_gene),
                         length(ge_pct_change_ge)),
-  Upregulated = c(sum(dominant_transcripts_diff$type == 'up', na.rm = TRUE),
+  Upregulated = c(sum(dominant_transcripts_diff$type == opt$ident_1, na.rm = TRUE),
                   sum(DTE$change == 'Up', na.rm = TRUE),
                   sum(DGE$change == 'Up', na.rm = TRUE),
                   sum(gene_pct$type == opt$ident_1, na.rm = TRUE)),
-  Downregulated = c(sum(dominant_transcripts_diff$type == 'down', na.rm = TRUE),
+  Downregulated = c(sum(dominant_transcripts_diff$type == opt$ident_2, na.rm = TRUE),
                     sum(DTE$change == 'Down', na.rm = TRUE),
                     sum(DGE$change == 'Down', na.rm = TRUE),
                     sum(gene_pct$type == opt$ident_2, na.rm = TRUE))

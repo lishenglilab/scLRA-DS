@@ -142,8 +142,6 @@ main <- function() {
   
   writeLines(info_lines, info_file)
   
-  system(paste0("find ", opts$output_dir, " -name 'part_*.txt' -exec sed -i '1s/^\\t//' {} \\;"))
-  
   cat("\nSplit completed successfully!\n")
   cat("Created", length(part_files), "part files\n")
   cat("Split info saved to:", info_file, "\n")

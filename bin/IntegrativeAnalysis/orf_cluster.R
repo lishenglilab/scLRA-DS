@@ -83,7 +83,7 @@ orf_df$orf_len <- nchar(orf_df$Sequence)
 # Select the longest ORF for each transcript
 orf_df <- orf_df %>% 
   group_by(transcript_id) %>% 
-  slice_max(orf_len) %>%
+  slice_max(orf_len, with_ties = FALSE) %>%
   ungroup()
 
 # Normalize transcript ID format
@@ -92,10 +92,13 @@ orf_df$transcript_id <- gsub('_', '-', orf_df$transcript_id)
 # Filter transcripts that exist in Seurat object
 orf_df <- orf_df[orf_df$transcript_id %in% rownames(sce.tr), ]
 orf_df <- orf_df[!duplicated(orf_df$transcript_id), ]
+if (nrow(orf_df) == 0) {
+  stop("No ORF-bearing transcripts matched the transcript Seurat object")
+}
 
 # Assign names to unique ORF sequences
 orf_name <- data.frame(Sequence = unique(orf_df$Sequence))
-orf_name$orf_name <- paste('ORF', 1:nrow(orf_name), sep = '_')
+orf_name$orf_name <- paste('ORF', seq_len(nrow(orf_name)), sep = '_')
 orf_df <- left_join(orf_df, orf_name, by = "Sequence")
 orf_df <- left_join(orf_df, id_map, by = "transcript_id")
 
@@ -160,7 +163,23 @@ sce.orf <- IntegrateLayers(
 # Clustering analysis
 cat("Performing clustering...\n")
 reduction_use <- "harmony"
-dims_range <- eval(parse(text = paste("c(", opt$dims, ")")))
+parse_dims <- function(value) {
+  value <- trimws(value)
+  if (grepl("^[0-9]+\\s*:\\s*[0-9]+$", value)) {
+    bounds <- as.integer(strsplit(gsub("[[:space:]]", "", value), ":", fixed = TRUE)[[1]])
+    dims <- seq.int(bounds[1], bounds[2])
+  } else if (grepl("^[0-9]+([[:space:]]*,[[:space:]]*[0-9]+)*$", value)) {
+    dims <- as.integer(strsplit(gsub("[[:space:]]", "", value), ",", fixed = TRUE)[[1]])
+  } else {
+    stop("--dims must be a positive range such as '1:30' or a comma-separated list")
+  }
+
+  if (length(dims) == 0 || any(is.na(dims)) || any(dims < 1)) {
+    stop("--dims must contain positive integers")
+  }
+  unique(dims)
+}
+dims_range <- parse_dims(opt$dims)
 
 sce.orf <- FindNeighbors(sce.orf, reduction = reduction_use, dims = dims_range) %>%
   FindClusters(resolution = opt$resolution) %>%

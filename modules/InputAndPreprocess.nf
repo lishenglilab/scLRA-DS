@@ -6,13 +6,14 @@ process PARSE_METADATA {
 
   input:
     path metadata
+    path pipeline_bin
 
   output:
     path "samples.tsv", emit: samples
 
   script:
     """
-    python ${projectDir}/bin/parse_metadata.py --metadata ${metadata} --out samples.tsv
+    python "${pipeline_bin}/parse_metadata.py" --metadata "${metadata}" --out samples.tsv
     """
 }
 
@@ -43,21 +44,22 @@ process BLAZE_RUN {
       exit 1
     fi
 
-    cp ${metadata} ${sample_id}.meta.tsv
+    cp "${metadata}" "${sample_id}.meta.tsv"
 
     blaze \
       --expect-cells ${params.expect_cells} \
-      --output-prefix ${sample_id}.blaze. \
+      --output-prefix "${sample_id}.blaze." \
       --threads ${params.threads} \
       --high-sensitivity-mode \
       --minimal_stdout \
-      --full-bc-whitelist ${whitelist} \
-      ${fastq}
+      --full-bc-whitelist "${whitelist}" \
+      "${fastq}"
     """
 }
 
 process FILTER_READS {
-  label 'sclong'
+  // NanoFilt is provided by envs/preprocess.yml, not the main sclong env.
+  label 'preprocess'
   tag { sample_id }
 
   publishDir "${params.outdir ?: 'Result'}/InputAndPreprocess/filtered_reads/${sample_id}", mode: 'copy'
@@ -70,9 +72,9 @@ process FILTER_READS {
 
   script:
     """
-    gunzip -c ${fastq_gz} \
+    gunzip -c "${fastq_gz}" \
       | NanoFilt -q ${params.nanofilt_q ?: 10} \
-      | gzip > ${sample_id}.hq.fastq.gz
+      | gzip > "${sample_id}.hq.fastq.gz"
     """
 }
 
@@ -90,12 +92,13 @@ process NANOPLOT_QC {
     path("all_samples_NanoPlot_output/*"), emit: nanoplot_output
   
   script:
+    def fastq_args = fastq_files.collect { fastq -> "\"${fastq}\"" }.join(' ')
     """
     mkdir -p all_samples_NanoPlot_output
     
     NanoPlot \
       -t ${params.threads ?: 2} \
-      --fastq ${fastq_files} \
+      --fastq ${fastq_args} \
       -o all_samples_NanoPlot_output \
       --title "All Samples Combined NanoPlot Report"
     
@@ -103,30 +106,33 @@ process NANOPLOT_QC {
     """
 }
 
-process DEEPSEEK_QC {
+process LLM_READ_QC {
   label 'preprocess'
-  tag "DEEPSEEK_QC"
+  tag "llm_read_qc"
   
+  // Keep the historical directory name so existing result consumers do not break.
   publishDir "${params.outdir ?: 'Result'}/InputAndPreprocess/deepseek_qc", mode: 'copy'
-  
-  when:
-    params.api_key && params.api_key != '' && params.api_key != '""'
   
   input:
     path nanoplot_stats_file
+    path pipeline_bin
   
   output:
-    path "qc_report.txt", emit: deepseek_qc_report
+    path "qc_report.txt", emit: llm_qc_report
+
+  when:
+    params.llm_enabled
   
   script:
     """
     # Run analysis
-    python ${projectDir}/bin/deepseek/read_qc_deekseek.py \
+    python "${pipeline_bin}/llm/read_qc.py" \
       --file_path "${nanoplot_stats_file}" \
-      --api_key "${params.api_key}" \
       --output_text_file "qc_report.txt" \
       --species "${params.species ?: 'Unknown'}" \
-      --tissue "${params.tissue ?: 'Unknown'}"
+      --tissue "${params.tissue ?: 'Unknown'}" \
+      --base_url "${params.llm_base_url}" \
+      --model "${params.llm_model}"
     """
 }
 
@@ -138,8 +144,9 @@ workflow InputAndPreprocess {
   main:
     meta_path = file(metadata_path)
     wl_path   = file(whitelist_path)
+    pipeline_bin = file("${projectDir}/bin", checkIfExists: true)
 
-    parsed = PARSE_METADATA(meta_path)
+    parsed = PARSE_METADATA(meta_path, pipeline_bin)
 
     // 准备原始数据通道给BLAZE_RUN
     ch_original_samples = parsed.samples
@@ -155,12 +162,12 @@ workflow InputAndPreprocess {
     filtered = FILTER_READS(blaze_results.matched_reads)
     
     ch_all_fastq_files = filtered.hq_fastq
-      .map { sample_id, fastq -> fastq }
+      .map { _sample_id, fastq -> fastq }
       .collect()
     nanoplot_qc = NANOPLOT_QC(ch_all_fastq_files)
     
-    // 条件执行DEEPSEEK_QC
-    deepseek_qc = DEEPSEEK_QC(nanoplot_qc.nanoplot_report)
+    // Optional provider-agnostic LLM report.
+    llm_qc = LLM_READ_QC(nanoplot_qc.nanoplot_report, pipeline_bin)
 
   emit:
     blaze_out = blaze_results.blaze_out
@@ -168,5 +175,7 @@ workflow InputAndPreprocess {
     filtered_fastq = filtered.hq_fastq
     qc_reports = nanoplot_qc.nanoplot_report
     qc_outputs = nanoplot_qc.nanoplot_output
-    deepseek_qc_report = deepseek_qc.deepseek_qc_report
+    llm_qc_report = llm_qc.llm_qc_report
+    // Backward-compatible alias for existing consumers.
+    deepseek_qc_report = llm_qc.llm_qc_report
 }

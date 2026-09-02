@@ -1,232 +1,177 @@
+# scLRA-LLM
 
-# Single-Cell Long-Read Transcriptomics Analysis Pipeline
-![image](https://github.com/lishenglilab/Single-Cell-Long-Read-Transcriptomics-Analysis-Pipeline/blob/main/Schematic.png)
-## Overview
+scLRA-LLM is a Nextflow DSL2 pipeline for single-cell long-read RNA-seq analysis. It connects read preprocessing, IsoQuant transcript reconstruction, gene- and transcript-level single-cell analysis, alternative-splicing analysis, ORF analysis, and optional LLM-assisted reporting in one workflow.
 
-A comprehensive Nextflow pipeline for analyzing single-cell long-read RNA sequencing data. This pipeline integrates multiple analysis modules to process raw sequencing data from FASTQ files to comprehensive biological interpretation, including alternative splicing analysis, ORF-based clustering, and LLM-assisted biological interpretation.
+LLM steps use an OpenAI-compatible Chat Completions endpoint and are not tied to a specific provider. All biological analysis steps can run with LLM support disabled.
 
-## Workflow Structure
+## Workflow
 
-The pipeline follows a sequential workflow organized into five main modules:
+| Module | Main tasks |
+| --- | --- |
+| `InputAndPreprocess` | Metadata validation, BLAZE barcode processing, NanoFilt filtering, NanoPlot QC, optional LLM read-QC report |
+| `AlignmentAndTranscriptReconstruction` | IsoQuant transcript reconstruction and quantification, transcript sequence extraction, ORF prediction, optional LLM assembly-QC report |
+| `PreliminarySingleCellAnalysis` | Gene/transcript matrices, Seurat QC and clustering, marker detection, optional LLM cell-type annotation and QC report |
+| `AlternativeSplicing` | SUPPA2 event quantification, dominant-isoform analysis, isoform-switch preparation and consequences, optional LLM interpretation |
+| `IntegrativeAnalysis` | DDTU, DTE, DGE and DGU integration, ORF clustering, optional LLM interpretation |
 
-### 1. Input and Preprocessing (`InputAndPreprocess.nf`)
-- **Metadata Parsing**: Reads metadata and whitelist files to set up initial input data
-- **FastQ Processing**: Prepares sample channels and runs preprocessing steps including:
-  - Blaze filtering to refine FastQ files
-  - Quality control with NanoPlot
-  - AI-assisted QC reports using DeepSeek
-- **Barcode Handling**: Extracts and validates cell barcodes from 10x Genomics data
-- **UMI Quality Control**: Filters and validates UMIs for accurate single-cell analysis
+The five modules are orchestrated from [`main.nf`](main.nf), with process definitions under [`modules/`](modules/).
 
-### 2. Alignment and Transcript Reconstruction (`AlignmentAndTranscriptReconstruction.nf`)
-- **Read Alignment**: Aligns sequencing reads to reference genome
-- **Transcript Reconstruction**: Reconstructs full-length transcripts using IsoQuant
-- **ORF Prediction**: Identifies open reading frames from reconstructed transcripts
-- **Quality Metrics**: Generates alignment and reconstruction statistics with AI-based quality assessment
+## Requirements
 
-### 3. Preliminary Single-Cell Analysis (`PreliminarySingleCellAnalysis.nf`)
-- **Dual-QC Framework**:
-  - QC-1: Initial quality assessment and cell filtering
-  - QC-2: Comprehensive evaluation of transcript reconstruction
-- **Data Processing**:
-  - Data normalization and batch correction
-  - Dimensionality reduction (PCA, UMAP)
-  - Cell clustering and AI-assisted cell type annotation 
-  - Marker gene identification
+- Linux
+- Nextflow with DSL2 support; the current workflow was validated with Nextflow 25.10.2
+- A Java version supported by the installed Nextflow release (Java 17 or newer for current Nextflow releases)
+- Conda or Mamba for the process environments
+- Sufficient CPU, memory and storage for IsoQuant and single-cell analysis
 
+The pipeline provides Conda YAML files for its Python and command-line dependencies. The main environment currently does not fully lock the R/Bioconductor stack; see [R environment](#r-environment).
 
-### 4. Alternative Splicing Analysis (`AlternativeSplicing.nf`)
-- **Splicing Event Detection**: Identifies alternative splicing patterns
-- **Intron Retention Analysis**: Detects and quantifies intron retention events
-- **Dominant Transcript Identification**: Identifies major transcript isoforms
-- **Isoform Switch Analysis**: Analyzes differential transcript usage and isoform switching between conditions
-- **AI-Assisted Isoform Interpretation**: Uses AI model to interpret isoform switch analysis results, providing biological context and mechanistic insights into transcript switching eventsUses DeepSeek models to predict functional consequences of isoform switches, prioritize biologically relevant isoforms, and provide biological context for switching events
+## Installation
 
-### 5. Integrative Analysis (`IntegrativeAnalysis.nf`)
-- **Differential Analysis**:
-  - Differential gene expression
-  - Differential transcript usage
-  - ORF-based clustering and expression analysis
-- **Multi-Omics Integration**: Combines results from multiple analysis modules
-- **Biological Interpretation**: AI-assisted interpretation using DeepSeek models
-- **ORF Clustering**: Advanced clustering based on open reading frame sequences
-
-## Quick Start
-
-### Prerequisites
-
-- Nextflow (>=22.10.0)
-- Java (>=11)
-
-### Installation
-
-1. Clone the repository:
 ```bash
-git clone https://github.com/lishenglilab/Single-Cell-Long-Read-Transcriptomics-Analysis-Pipeline.git
-cd Single-Cell-Long-Read-Transcriptomics-Analysis-Pipeline
+git clone https://github.com/lishenglilab/scLRA-LLM.git
+cd scLRA-LLM
+unzip assets/3M-february-2018.zip -d assets
 ```
 
-2. Test the installation:
+The archive contains the 10x 3M barcode whitelist referenced by the default configuration. If a different chemistry or whitelist is used, update `params.whitelist` instead. No API credentials are required when LLM support is disabled.
+
+## Input configuration
+
+Before running, edit [`nextflow.config`](nextflow.config) and check at least:
+
+- `params.metadata`
+- `params.whitelist`
+- `params.reference_fa`
+- `params.genedb_gtf`
+- `params.sample_stage_mapping`
+- `params.comparisons`
+- Thread counts and analysis thresholds appropriate for the server
+
+### Metadata
+
+Metadata may be TSV or CSV and must contain `sample_id` and `fastq` columns. Absolute FASTQ paths are recommended.
+
+```text
+sample_id<TAB>fastq
+AD1<TAB>/absolute/path/AD1.fastq
+AD2<TAB>/absolute/path/AD2.fastq
+N1<TAB>/absolute/path/N1.fastq
+```
+
+Sample IDs must be unique and may contain letters, numbers, `.`, `_` and `-`.
+
+### Groups and comparisons
+
+Each sample must map to a biological group:
+
+```groovy
+sample_stage_mapping = [
+  ["AD1", "AD"],
+  ["AD2", "AD"],
+  ["N1",  "Normal"]
+]
+```
+
+Comparisons use `[group1, group2, comparison_name]`:
+
+```groovy
+comparisons = [
+  ["AD", "Normal", "AD_vs_Normal"]
+]
+```
+
+Comparison names must be unique and may contain letters, numbers, `.`, `_` and `-`. Both groups must occur in `sample_stage_mapping`.
+
+## Provider-neutral LLM configuration
+
+The optional LLM processes use the OpenAI Python SDK against an OpenAI-compatible Chat Completions API. Configure credentials with environment variables:
+
 ```bash
-nextflow run main.nf --help
+export LLM_BASE_URL='https://provider.example/v1'
+export LLM_API_KEY='your-key'
+export LLM_MODEL='provider-model-name'
 ```
 
-### Basic Usage
-Prepare your input files:
-- Raw long-read FASTQ files (PacBio or Oxford Nanopore)
-- 10x Genomics barcode metadata
-- Reference genome assembly (FASTA format)
-- Gene annotation (GTF format)
-- Sample metadata CSV file
+- `LLM_BASE_URL` and `LLM_API_KEY` identify and authenticate the endpoint.
+- `LLM_MODEL` is optional for backward compatibility, but should normally be set for a non-DeepSeek endpoint. OpenAI-compatible APIs require a model string and cannot reliably infer one from a multi-model URL.
+- If `LLM_API_KEY` is absent, LLM steps are disabled automatically and all non-LLM analyses continue.
+- Use `--llm_enabled false` to disable LLM calls explicitly.
+- Enabling LLM without a key or a valid absolute HTTP(S) base URL fails during workflow validation.
 
-```nextflow
-// Configuration file for Single-Cell Long-Read Transcriptomics Analysis Pipeline
-nextflow.enable.dsl = 2
+The API key is deliberately not stored in `nextflow.config`, Nextflow parameters, task command lines, metadata or committed `.env` files. Do not pass real credentials on the command line.
 
-params {
-  // Study description for AI-assisted interpretation
-  study_description = "Your study description here..."
-  
-  // Output directory
-  outdir = "results"
-  
-  // DeepSeek API configuration
-  api_key = "your_api_key_here"
-  species = 'Human'
-  tissue = 'Skin'
-  
-  // Input files
-  metadata = "metadata.tsv"
-  reference_fa = "reference.fa"
-  genedb_gtf = "annotation.gtf"
-  whitelist = "barcodes.txt"
-  
-  // QC parameters
-  expect_cells = 300
-  min_cells = 10
-  min_features = 200
-  
-  // Analysis parameters
-  comparisons = [
-    ["Condition_A", "Condition_B", "Condition_A_vs_Condition_B"]
-  ]
-  
-  // AI-assisted features
-  enable_ai_cell_annotation = true
-  enable_ai_quality_assessment = true
-  enable_ai_isoform_interpretation = true
-}
+Some output directories and JSON filenames retain historical `deepseek_*` names so existing downstream consumers do not break. These names do not restrict the configured provider; provider-neutral CLI entry points live in [`bin/llm/`](bin/llm/).
 
-// Conda environments for reproducible analysis
-conda.enabled = true
-conda.cacheDir = "${projectDir}/.conda"
+## Running the pipeline
 
-process {
-  conda = "${projectDir}/envs/sclong.yml"
-}
+Select the compatible R interpreter when more than one R installation is available:
 
-Run the complete pipeline:
 ```bash
-nextflow run main.nf -c params.config 
+export RSCRIPT_BIN='/usr/bin/Rscript'
+"$RSCRIPT_BIN" --version
 ```
 
-## Input Requirements
+Run the full workflow:
 
-### Required Files
-- **Metadata CSV**: Contains at minimum sample and bam columns, plus additional sample information
-- **Reference Genome**: FASTA format, indexed if required by alignment tools
-- **Gene Annotation**: GTF format with transcript models
-- **FastQ Files**: Raw sequencing reads, can be compressed (.fastq.gz)
-
-### File Structure Example
-```
-input/
-├── fastq/
-│   ├── sample1.fastq.gz
-│   └── sample2.fastq.gz
-├── metadata.csv
-├── reference.fa
-├── reference.fa.fai
-└── annotation.gtf
+```bash
+nextflow run main.nf -resume
 ```
 
-### Output Structure
+Run without any LLM requests:
+
+```bash
+nextflow run main.nf -resume --llm_enabled false
 ```
+
+Useful structure-only checks:
+
+```bash
+NXF_OFFLINE=true nextflow lint main.nf nextflow.config modules/*.nf
+NXF_OFFLINE=true nextflow run main.nf -preview --llm_enabled false
+```
+
+Nextflow caching is enabled. Keep `work/` and use `-resume` to reuse successfully completed tasks.
+
+## Output layout
+
+The default output root is `results/`:
+
+```text
 results/
 ├── InputAndPreprocess/
-│   ├── filtered_fastq/
-│   ├── qc_reports/
-│   ├── nanoplot_results/
-│   └── deepseek_qc/
-│
 ├── AlignmentAndTranscriptReconstruction/
-│   ├── aligned_bam/
-│   ├── transcript_models.gtf
-│   ├── orf_predictions.fa
-│   └── alignment_stats/
-│
 ├── PreliminarySingleCellAnalysis/
-│   ├── seurat_gene.rds
-│   ├── seurat_tr.rds
-│   ├── clustering_results/
-│   ├── marker_genes/
-│   └── qc_plots/
-│
 ├── AlternativeSplicing/
-│   ├── splicing_events/
-│   ├── intron_retention/
-│   ├── dominant_transcripts/
-│   └── differential_splicing/
-│
 └── IntegrativeAnalysis/
-    ├── differential_expression/
-    ├── orf_clustering/
-    ├── biological_interpretation/
-    └── integrated_reports/
 ```
 
+Each module publishes its reports, tables, plots and reusable objects below its corresponding directory. Large intermediate files remain in the Nextflow `work/` directory.
 
+## R environment
 
-### Key Parameters
-```nextflow
-// Basic input parameters
-params.metadata = "metadata.csv"
-params.reference_fa = "reference.fa"
-params.genedb_gtf = "annotation.gtf"
-params.whitelist = "barcodes.tsv"
+The R scripts use packages including Seurat, tidyverse, data.table, harmony, rtracklayer, IsoformSwitchAnalyzeR, DESeq2, muscat, BSgenome.Hsapiens.UCSC.hg38, Biostrings, ggVennDiagram and UpSetR.
 
-// QC parameters
-params.qc_min_cells = 3
-params.qc_min_features = 200
-params.qc_max_mt_percent = 20
+The current [`envs/sclong.yml`](envs/sclong.yml) mainly locks Python and command-line packages. For production deployment, create a dedicated R/Bioconductor environment matched to the server's R version and set `RSCRIPT_BIN` to that environment's `Rscript`. Avoid installing packages dynamically during a production run.
 
-// Single-cell analysis parameters
-params.resolution = 0.8
-params.pca_dims = 30
-params.umap_dims = 2
+## Validation and compatibility
 
-// Differential analysis
-params.comparisons = [["AD", "Normal", "AD_vs_Normal"]]
-params.logfc_threshold = 1.5
-params.pval_threshold = 0.05
+The optimized version has been checked with:
 
-// ORF clustering
-params.orf_resolution = 0.4
-params.orf_dims = "1:30"
+- Nextflow lint and preview
+- Python 3.11 and the workflow's Python 3.7 environment
+- Parsing and CLI startup for all eight R scripts
+- Conda YAML parsing
+- Offline regression cases for malformed FASTQ and metadata, NanoStats and SQANTI parsing, cell-annotation parsing, empty differential results, assembly error outputs and ORF ambiguity handling
 
-// DeepSeek integration
-params.api_key = ""  // Required for AI-assisted interpretation
-params.study_description = "Single-cell long-read study"
-params.species = "Human"  // For DeepSeek context
-params.tissue = "Skin"    // For DeepSeek context
-```
+The optimization did not add new biological analysis stages. To preserve the existing analysis scope, isoform-switch preparation still uses the first entry in `params.comparisons`, while dominant-isoform and integrative differential analyses iterate over all comparisons.
 
-## Running the Pipeline
+## Security
 
-### Complete Analysis
-```bash
-# Run all modules sequentially
-nextflow run main.nf 
-```
+- Never commit API keys, tokens or private endpoint credentials.
+- Keep local secret files outside the repository; `.env*` files are ignored by default.
+- If a credential has ever been committed, deleting it in a later commit is not sufficient. Revoke and rotate the credential immediately, then clean the Git history if required.
 
+## License
 
+This project is distributed under the terms in [`LICENSE`](LICENSE).

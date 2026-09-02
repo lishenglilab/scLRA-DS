@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""
-Isoform Switch Biological Interpretation using DeepSeek API
-Analyzes isoform switching consequences and provides biological interpretation
-"""
+"""LLM-assisted biological interpretation of isoform-switch consequences."""
 
 import pandas as pd
 import argparse
 import sys
 import os
-from openai import OpenAI
 import json
 from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from llm.client import (
+    add_llm_arguments,
+    client_from_args,
+    response_text,
+    response_total_tokens,
+)
 
 def parse_consequences_file(consequences_file):
     """
@@ -25,8 +30,15 @@ def parse_consequences_file(consequences_file):
     try:
         df = pd.read_csv(consequences_file, sep="\t")
         
-        # Filter rows with isoformsDifferent = True
-        df_true = df[df['isoformsDifferent'] == True]
+        # Accept boolean and common textual encodings from R/data.table.
+        is_different = (
+            df['isoformsDifferent']
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .isin({'true', 't', '1', 'yes'})
+        )
+        df_true = df[is_different]
         
         if df_true.empty:
             return {
@@ -47,7 +59,7 @@ def parse_consequences_file(consequences_file):
         true_consequences = []
         
         for _, row in gene_consequences.iterrows():
-            if row['isoformsDifferent'] == True and pd.notna(row['switchConsequence']):
+            if pd.notna(row['switchConsequence']):
                 feature = row['featureCompared']
                 consequence = row['switchConsequence']
                 true_consequences.append({
@@ -76,7 +88,7 @@ def parse_consequences_file(consequences_file):
 
 def generate_prompt(gene_data, study_description):
     """
-    Generate prompt for DeepSeek API
+    Generate a prompt for the configured LLM API
     
     Parameters:
     gene_data (dict): Gene information and consequences
@@ -109,27 +121,25 @@ Please provide interpretation covering the following aspects:
 1. Known function of this gene (if known)
 2. How these consequences (e.g., ORF shortening, domain loss, IDR loss) might affect protein function
 3. Potential implications for cellular function in the disease context (AD, atopic dermatitis)
-4. Possible regulatory mechanisms (e.g., splicing factor changes)
+4. Possible regulatory mechanisms (e.g., splicing factor changes) in the study context
 
 Please respond in English and ensure the explanation is concise, professional, and suitable for biologists.
 """
     return prompt
 
-def call_deepseek_api(prompt, api_key, model="deepseek-chat"):
+def call_llm_api(prompt, client, model="deepseek-chat"):
     """
-    Call DeepSeek API for biological interpretation
+    Call an OpenAI-compatible API for biological interpretation
     
     Parameters:
     prompt (str): Prompt for the model
-    api_key (str): DeepSeek API key
+    client: Configured OpenAI-compatible client
     model (str): Model to use
     
     Returns:
     dict: API response and status
     """
     try:
-        client = OpenAI(api_key=api_key, base_url='https://api.deepseek.com')
-        
         response = client.chat.completions.create(
             model=model,
             messages=[
@@ -146,13 +156,13 @@ def call_deepseek_api(prompt, api_key, model="deepseek-chat"):
             max_tokens=2000
         )
         
-        interpretation = response.choices[0].message.content
+        interpretation = response_text(response)
         
         return {
             'status': 'success',
             'interpretation': interpretation,
             'model': model,
-            'tokens_used': response.usage.total_tokens if hasattr(response, 'usage') else 'unknown'
+            'tokens_used': response_total_tokens(response)
         }
         
     except Exception as e:
@@ -163,7 +173,7 @@ def call_deepseek_api(prompt, api_key, model="deepseek-chat"):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Generate biological interpretation for isoform switching using DeepSeek API'
+        description='Generate biological interpretation for isoform switching using an OpenAI-compatible API'
     )
     
     # Required arguments
@@ -175,30 +185,18 @@ def main():
                        help='Path to save the API response details')
     
     # Optional arguments
-    parser.add_argument('--api_key', default='',
-                       help='DeepSeek API key (required for API-based interpretation)')
     parser.add_argument('--study_description', default='',
                        help='Study context description')
-    parser.add_argument('--model', default='deepseek-chat',
-                       help='DeepSeek model to use (default: deepseek-chat)')
     parser.add_argument('--save_prompt', action='store_true',
                        help='Save the generated prompt to a file')
+    add_llm_arguments(parser, default_model='deepseek-chat')
     
     args = parser.parse_args()
     
-    # Check if API key is provided
-    if not args.api_key or args.api_key == '':
-        print("ERROR: DeepSeek API key is not provided. Please set --api_key parameter.")
-        with open(args.output_report, 'w') as f:
-            f.write("Biological interpretation skipped: API key not provided.\n")
-            f.write("To generate biological interpretation, please provide a DeepSeek API key.\n")
-        with open(args.output_api, 'w') as f:
-            f.write(json.dumps({
-                'status': 'skipped',
-                'message': 'API key not provided',
-                'timestamp': datetime.now().isoformat()
-            }, indent=2))
-        sys.exit(0)
+    try:
+        client = client_from_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     
     # Set default study description if not provided
     if not args.study_description:
@@ -227,6 +225,8 @@ exploring disease-associated isoform switching and its functional consequences."
                 'message': 'No significant consequences found',
                 'timestamp': datetime.now().isoformat()
             }, indent=2))
+        with open('gene_summary.txt', 'w') as f:
+            f.write("No significant isoform-switch consequences were available.\n")
         sys.exit(0)
     
     # Generate prompt
@@ -239,9 +239,9 @@ exploring disease-associated isoform switching and its functional consequences."
             f.write(prompt)
         print(f"Prompt saved to: {prompt_file}")
     
-    # Call DeepSeek API
-    print("Calling DeepSeek API...")
-    api_result = call_deepseek_api(prompt, args.api_key, args.model)
+    # Call the configured LLM API.
+    print("Calling LLM API...")
+    api_result = call_llm_api(prompt, client, args.model)
     
     if api_result['status'] == 'success':
         interpretation = api_result['interpretation']

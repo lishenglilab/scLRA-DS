@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Assembly QC analysis using DeepSeek API
+Assembly QC analysis using an OpenAI-compatible API
 Analyzes transcriptome assembly metrics and generates evaluation report
 """
 
@@ -10,7 +10,10 @@ import pandas as pd
 import numpy as np
 import os
 import sys
-from openai import OpenAI
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from llm.client import add_llm_arguments, client_from_args, response_text
 
 def parse_assembly_files(isoquant_dir):
     """
@@ -36,8 +39,7 @@ def parse_assembly_files(isoquant_dir):
     required_files = [gene_counts_file, transcript_counts_file, transcript_models_file]
     for f in required_files:
         if not os.path.exists(f):
-            print(f"ERROR: Required file not found: {f}")
-            sys.exit(1)
+            raise FileNotFoundError(f"Required IsoQuant output not found: {f}")
     
     # 1. Load gene counts - FIXED: don't skip header with comment='#'
     try:
@@ -174,22 +176,29 @@ def parse_assembly_files(isoquant_dir):
     novel_type_counts = {}
     if os.path.exists(novel_vs_known_file):
         try:
-            novel_data = pd.read_csv(novel_vs_known_file, sep="\t")
-            if 'structural_category' in novel_data.columns:
-                # Check column names for transcript ID
-                transcript_id_col = None
-                for col in novel_data.columns:
-                    if 'transcript' in col.lower():
-                        transcript_id_col = col
-                        break
-                
-                if transcript_id_col:
-                    novel_transcripts_data = novel_data[novel_data[transcript_id_col].astype(str).str.startswith('transcript', na=False)]
-                    novel_type_counts = novel_transcripts_data['structural_category'].value_counts().to_dict()
-                    print(f"  Novel transcript types: {len(novel_type_counts)} categories")
-                else:
-                    print(f"  WARNING: Could not find transcript ID column in novel vs known file")
-                    novel_type_counts = {"error": "Could not find transcript ID column"}
+            with open(novel_vs_known_file, "r") as handle:
+                first_field = handle.readline().split("\t", 1)[0].lstrip("#").strip()
+
+            # IsoQuant 3.7 outputs can be either headered or headerless. Only
+            # columns 1 and 6 are required for this metric.
+            has_header = first_field == "isoform"
+            novel_data = pd.read_csv(
+                novel_vs_known_file,
+                sep="\t",
+                header=0 if has_header else None,
+                usecols=[0, 5],
+                names=None if has_header else ["isoform", "structural_category"],
+            )
+            if has_header:
+                novel_data.columns = [str(col).lstrip("#") for col in novel_data.columns]
+
+            novel_transcripts_data = novel_data[
+                novel_data["isoform"].astype(str).str.startswith("transcript", na=False)
+            ]
+            novel_type_counts = (
+                novel_transcripts_data["structural_category"].value_counts().to_dict()
+            )
+            print(f"  Novel transcript types: {len(novel_type_counts)} categories")
         except Exception as e:
             novel_type_counts = {"error": f"Failed to parse novel types: {str(e)}"}
             print(f"  ERROR parsing novel types: {e}")
@@ -200,9 +209,14 @@ def parse_assembly_files(isoquant_dir):
     
     # 5. Calculate additional metrics
     if metrics['total_genes'] > 0:
-        metrics['genes_per_transcript'] = float(metrics['total_transcripts'] / metrics['total_genes'])
+        metrics['transcripts_per_gene'] = float(
+            metrics['total_transcripts'] / metrics['total_genes']
+        )
     else:
-        metrics['genes_per_transcript'] = 0.0
+        metrics['transcripts_per_gene'] = 0.0
+    # Keep the historical JSON key for existing result consumers. Its value
+    # has always represented transcripts per gene despite the old name.
+    metrics['genes_per_transcript'] = metrics['transcripts_per_gene']
     
     # Calculate percentage of novel features
     if metrics['total_genes'] > 0:
@@ -224,22 +238,20 @@ def parse_assembly_files(isoquant_dir):
     
     return metrics
 
-def generate_assembly_report(metrics, api_key, species="Human", tissue="Skin", model="deepseek-reasoner"):
+def generate_assembly_report(metrics, client, species="Human", tissue="Skin", model="deepseek-reasoner"):
     """
     Generate an assembly quality report from the parsed metrics
     
     Parameters:
     metrics (dict): Dictionary containing assembly metrics
-    api_key (str): API key for the model
+    client: Configured OpenAI-compatible client
     species (str): The species of the sample (default is "Human")
     tissue (str): The tissue type of the sample (default is "Skin")
-    model (str): The model to use (default is "deepseek-reasoner")
+    model (str): Model name exposed by the configured endpoint
     
     Returns:
     str: The content of the generated QC report
     """
-    client = OpenAI(api_key=api_key, base_url='https://api.deepseek.com')
-    
     # Format novel transcript types for display
     novel_types_str = "\n"
     if metrics['novel_transcript_types']:
@@ -266,7 +278,7 @@ ASSEMBLY METRICS:
 - Transcript length range: {metrics.get('transcript_length_min', 'N/A')} - {metrics.get('transcript_length_max', 'N/A')} bp
 - Median transcript length: {metrics.get('transcript_length_median', 'N/A')} bp
 - Mean transcript length: {metrics.get('transcript_length_mean', 'N/A'):.1f} bp
-- Genes per transcript ratio: {metrics.get('genes_per_transcript', 'N/A'):.2f}
+- Transcripts per gene ratio: {metrics.get('transcripts_per_gene', metrics.get('genes_per_transcript', 0)):.2f}
 
 NOVEL TRANSCRIPT TYPES:
 {novel_types_str}
@@ -281,7 +293,7 @@ Please consider:
 Provide a comprehensive but concise report suitable for researchers, including specific recommendations for quality improvement if needed.
 """
 
-    # Sending the request to DeepSeek API
+    # Send the request to the configured OpenAI-compatible API.
     messages = [{"role": "system", "content": system_prompt}]
     
     completion = client.chat.completions.create(
@@ -290,33 +302,48 @@ Provide a comprehensive but concise report suitable for researchers, including s
     )
 
     # Get the response content from the model
-    response_content = completion.choices[0].message.content
+    response_content = response_text(completion)
     
     return response_content
 
 def main():
     # Parse arguments
-    parser = argparse.ArgumentParser(description="Generate assembly QC report using DeepSeek API")
+    parser = argparse.ArgumentParser(description="Generate an assembly QC report using an OpenAI-compatible API")
     
     # Arguments
     parser.add_argument('--isoquant_dir', required=True, help='Path to IsoQuant output directory')
-    parser.add_argument('--api_key', required=True, help='API key for DeepSeek model')
     parser.add_argument('--output_text_file', required=True, help='Path to save the output QC report')
     parser.add_argument('--species', default="Human", help='The species of the sample (default: Human)')
     parser.add_argument('--tissue', default="Skin", help='The tissue type of the sample (default: Skin)')
-    parser.add_argument('--model', default="deepseek-reasoner", help='The model to use (default: deepseek-reasoner)')
     parser.add_argument('--save_metrics', action='store_true', help='Save metrics to JSON file')
+    add_llm_arguments(parser)
 
     # Parse the arguments
     args = parser.parse_args()
     
-    # Check if API key is provided
-    if not args.api_key or args.api_key == "":
-        print("ERROR: API key is required")
-        sys.exit(1)
+    try:
+        client = client_from_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     
-    # Parse the assembly files
-    metrics = parse_assembly_files(args.isoquant_dir)
+    # Parse the assembly files. This is an optional reporting step, so keep an
+    # unexpected IsoQuant layout from aborting the biological workflow.
+    try:
+        metrics = parse_assembly_files(args.isoquant_dir)
+    except Exception as exc:
+        metrics = {"status": "error", "error": str(exc)}
+        report_content = (
+            "Failed to parse the IsoQuant outputs for the assembly QC report.\n"
+            f"Error: {exc}\n"
+        )
+        if args.save_metrics:
+            metrics_file = args.output_text_file.replace('.txt', '_metrics.json')
+            with open(metrics_file, 'w') as f:
+                json.dump(metrics, f, indent=2)
+        with open(args.output_text_file, 'w') as f:
+            f.write(report_content)
+        print(report_content, file=sys.stderr)
+        return
     
     # Save metrics if requested
     if args.save_metrics:
@@ -325,14 +352,22 @@ def main():
             json.dump(metrics, f, indent=2)
         print(f"Metrics saved to: {metrics_file}")
     
-    # Generate the assembly QC report
-    report_content = generate_assembly_report(
-        metrics, 
-        api_key=args.api_key, 
-        species=args.species, 
-        tissue=args.tissue, 
-        model=args.model
-    )
+    # Keep this optional reporting step from aborting the biological workflow
+    # when the configured provider is temporarily unavailable.
+    try:
+        report_content = generate_assembly_report(
+            metrics,
+            client=client,
+            species=args.species,
+            tissue=args.tissue,
+            model=args.model,
+        )
+    except Exception as exc:
+        report_content = (
+            "Failed to generate the assembly QC report via the configured LLM API.\n"
+            f"Error: {exc}\n"
+        )
+        print(report_content, file=sys.stderr)
     
     # Save the result to the output text file
     with open(args.output_text_file, 'w') as f:

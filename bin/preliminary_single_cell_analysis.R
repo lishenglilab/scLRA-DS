@@ -7,17 +7,6 @@ library(ggplot2)
 library(patchwork)
 library(optparse)
 
-# Function to run scrublet for doublet detection
-source_scrublet <- function() {
-  # Try to load scrubletR, install if not available
-  if (!require(scrubletR)) {
-    cat("scrubletR not available, trying to install...\n")
-    if (!require(remotes)) install.packages("remotes")
-    remotes::install_github("sgcook/scrubletR")
-    library(scrubletR)
-  }
-}
-
 # Parse command line arguments
 parse_arguments <- function() {
   option_list <- list(
@@ -32,9 +21,20 @@ parse_arguments <- function() {
     make_option(c("--tissue"), type="character", default="Skin",
                 help="Tissue type", metavar="character"),
     make_option(c("--api_key"), type="character", default=NULL,
-                help="API key for DeepSeek (optional)", metavar="character"),
+                help="Deprecated: use the LLM_API_KEY environment variable", metavar="character"),
     make_option(c("--project_dir"), type="character", default=".",
-                help="Project directory path (for finding Python scripts)", metavar="character")
+                help="Project directory path (for finding Python scripts)", metavar="character"),
+    make_option(c("--min_cells"), type="integer", default=10,
+                help="Minimum cells expressing a feature [default: %default]"),
+    make_option(c("--min_features"), type="integer", default=200,
+                help="Minimum detected features per cell [default: %default]"),
+    make_option(c("--llm_enabled"), type="character",
+                default=ifelse(nzchar(Sys.getenv("LLM_API_KEY")), "true", "false"),
+                help="Whether optional LLM annotation is enabled [default: %default]"),
+    make_option(c("--llm_base_url"), type="character", default=Sys.getenv("LLM_BASE_URL"),
+                help="OpenAI-compatible API base URL"),
+    make_option(c("--llm_model"), type="character", default=Sys.getenv("LLM_MODEL", "deepseek-reasoner"),
+                help="Model name exposed by the configured API")
   )
   
   opt_parser <- OptionParser(option_list=option_list)
@@ -68,8 +68,8 @@ process_seurat <- function(obj, matrix_type, species) {
     
     obj <- subset(
       obj,
-      subset = log_nFeature > median(log10(nFeature)) - 3 * mad(log10(nFeature)) &
-        log_nCount > median(log10(nCount)) - 3 * mad(log10(nCount))
+      subset = log_nFeature >= median(log10(nFeature)) - 3 * mad(log10(nFeature)) &
+        log_nCount >= median(log10(nCount)) - 3 * mad(log10(nCount))
     )
     
     return(obj)
@@ -126,7 +126,7 @@ process_seurat <- function(obj, matrix_type, species) {
     obj <- PercentageFeatureSet(obj, pattern = mt_pattern, col.name = "percent.mt")
     
     # Run doublet detection if scrubletR is available
-    doublet_rate <- 0
+    doublet_rate <- NA_real_
     if (require(scrubletR, quietly = TRUE)) {
       tryCatch({
         obj <- scrublet_R(obj)
@@ -150,10 +150,10 @@ process_seurat <- function(obj, matrix_type, species) {
     
     obj <- subset(
       obj,
-      subset = log_nFeature > median(log10(nFeature)) - 3 * mad(log10(nFeature)) &
-        log_nCount > median(log10(nCount)) - 3 * mad(log10(nCount)) &
-        percent.mt < median(mt) + 3 * mad(mt) &
-        obj$predicted_doublets == FALSE
+      subset = log_nFeature >= median(log10(nFeature)) - 3 * mad(log10(nFeature)) &
+        log_nCount >= median(log10(nCount)) - 3 * mad(log10(nCount)) &
+        percent.mt <= median(mt) + 3 * mad(mt) &
+        !predicted_doublets
     )
     
     # Standard analysis
@@ -174,16 +174,16 @@ process_seurat <- function(obj, matrix_type, species) {
   return(obj)
 }
 
-# Function to run cell annotation with DeepSeek
-annotate_cells_deepseek <- function(markers_file, output_csv, api_key, species, tissue, project_dir) {
-  # Check if API key is available
-  if (is.null(api_key) || api_key == "") {
-    cat("No API key provided, skipping DeepSeek annotation\n")
+# Function to run cell annotation with an OpenAI-compatible LLM endpoint.
+annotate_cells_llm <- function(markers_file, output_csv, species, tissue,
+                               project_dir, base_url, model) {
+  if (!nzchar(Sys.getenv("LLM_API_KEY"))) {
+    cat("LLM_API_KEY is not set; skipping LLM cell annotation\n")
     return(NULL)
   }
   
   # Set Python script path
-  python_script <- file.path(project_dir, "bin", "deepseek", "cell_ann_deekseek.py")
+  python_script <- file.path(project_dir, "bin", "llm", "cell_annotation.py")
   
   # Check if Python script exists
   if (!file.exists(python_script)) {
@@ -191,19 +191,28 @@ annotate_cells_deepseek <- function(markers_file, output_csv, api_key, species, 
     return(NULL)
   }
   
-  # Run Python script for annotation
-  cmd <- sprintf("python %s --csv_file_path %s --api_key %s --output_csv %s --species %s --tissue %s",
-                 python_script, markers_file, api_key, output_csv, species, tissue)
-  
-  cat("Running DeepSeek annotation...\n")
-  cat("Command:", cmd, "\n")
-  
-  system(cmd)
+  args <- c(
+    shQuote(python_script),
+    "--csv_file_path", shQuote(markers_file),
+    "--output_csv", shQuote(output_csv),
+    "--species_type", shQuote(species),
+    "--tissue_type", shQuote(tissue),
+    "--base_url", shQuote(base_url),
+    "--model", shQuote(model)
+  )
+
+  cat("Running LLM cell annotation...\n")
+  status <- system2("python", args = args)
+
+  if (length(status) != 1 || is.na(status) || status != 0) {
+    cat("LLM annotation command failed with exit status:", status, "\n")
+    return(NULL)
+  }
   
   if (file.exists(output_csv)) {
     return(read.csv(output_csv))
   } else {
-    cat("DeepSeek annotation failed or no output file created\n")
+    cat("LLM annotation failed or no output file created\n")
     return(NULL)
   }
 }
@@ -318,19 +327,22 @@ calculate_qc_metrics <- function(obj.ge, obj.tr) {
 main <- function() {
   # Parse arguments
   opts <- parse_arguments()
+
+  llm_enabled_value <- tolower(trimws(opts$llm_enabled))
+  if (!llm_enabled_value %in% c("true", "false", "1", "0", "yes", "no")) {
+    stop("--llm_enabled must be true or false", call. = FALSE)
+  }
+  llm_enabled <- llm_enabled_value %in% c("true", "1", "yes")
+
+  # Backward compatibility for direct callers while keeping the key out of
+  # child-process command lines.
+  if (!is.null(opts$api_key) && nzchar(opts$api_key) && !nzchar(Sys.getenv("LLM_API_KEY"))) {
+    warning("--api_key is deprecated; set LLM_API_KEY instead")
+    Sys.setenv(LLM_API_KEY = opts$api_key)
+  }
   
   # Create output directory
   dir.create(opts$output_dir, recursive = TRUE, showWarnings = FALSE)
-  
-  # Load libraries
-  cat("Loading required packages...\n")
-  required_packages <- c("Seurat", "tidyverse", "ggplot2", "patchwork")
-  for (pkg in required_packages) {
-    if (!require(pkg, character.only = TRUE)) {
-      install.packages(pkg, repos = "https://cloud.r-project.org")
-      library(pkg, character.only = TRUE)
-    }
-  }
   
   # Try to load harmony
   if (!require(harmony)) {
@@ -346,15 +358,15 @@ main <- function() {
   cat("Loading gene matrix from:", opts$gene_matrix, "\n")
   sce.gene.raw <- CreateSeuratObject(
     counts = Read10X(data.dir = opts$gene_matrix),
-    min.cells = 10,
-    min.features = 200
+    min.cells = opts$min_cells,
+    min.features = opts$min_features
   )
   
   cat("Loading transcript matrix from:", opts$transcript_matrix, "\n")
   sce.tr.raw <- CreateSeuratObject(
     counts = Read10X(data.dir = opts$transcript_matrix),
-    min.cells = 10,
-    min.features = 200
+    min.cells = opts$min_cells,
+    min.features = opts$min_features
   )
   
   # Keep only common cells from raw data
@@ -370,12 +382,12 @@ main <- function() {
   
   # Gene-level analysis
   cat("\n=== Gene-level analysis ===\n")
-  sce.gene.raw$orig.ident <- gsub('_.*', '', colnames(sce.gene.raw))
+  sce.gene.raw$orig.ident <- sub('_[^_]+$', '', colnames(sce.gene.raw))
   sce.gene <- process_seurat(sce.gene.raw, matrix_type = 'gene', species = opts$species)
   
   # Transcript-level analysis
   cat("\n=== Transcript-level analysis ===\n")
-  sce.tr.raw$orig.ident <- gsub('_.*', '', colnames(sce.tr.raw))
+  sce.tr.raw$orig.ident <- sub('_[^_]+$', '', colnames(sce.tr.raw))
   sce.tr <- process_seurat(sce.tr.raw, matrix_type = 'transcript', species = opts$species)
   
   # Get common cells after processing
@@ -412,7 +424,7 @@ main <- function() {
   ggsave(file.path(opts$output_dir, "gene_cluster_marker_dotplot.pdf"),
          plot = p, width = 20, height = 15)
   
-  # Prepare markers for DeepSeek annotation
+  # Prepare markers for optional LLM annotation
   anno_ge <- all_cluster_markers %>%
     filter(!grepl('novel', gene)) %>%
     group_by(cluster) %>%
@@ -423,17 +435,19 @@ main <- function() {
   write.table(anno_ge, anno_file, sep = ",", 
               row.names = FALSE, quote = FALSE, col.names = FALSE)
   
-  # Run DeepSeek annotation if API key is provided
-  if (!is.null(opts$api_key) && opts$api_key != "") {
-    cat("Running DeepSeek cell annotation...\n")
+  # Run LLM annotation if endpoint and API key are provided.
+  annotation_applied <- FALSE
+  if (llm_enabled && nzchar(Sys.getenv("LLM_API_KEY")) && nzchar(opts$llm_base_url)) {
+    cat("Running LLM cell annotation...\n")
     annotation_file <- file.path(opts$output_dir, "cell_ann_by_llm.csv")
-    cell_ann <- annotate_cells_deepseek(
+    cell_ann <- annotate_cells_llm(
       markers_file = anno_file,
       output_csv = annotation_file,
-      api_key = opts$api_key,
       species = opts$species,
       tissue = opts$tissue,
-      project_dir = opts$project_dir
+      project_dir = opts$project_dir,
+      base_url = opts$llm_base_url,
+      model = opts$llm_model
     )
     
     if (!is.null(cell_ann)) {
@@ -491,8 +505,11 @@ main <- function() {
       
       ggsave(file.path(opts$output_dir, "gene_celltype_markers_dotplot.pdf"),
              plot = p, width = 20, height = 15)
+      annotation_applied <- TRUE
     }
-  } else {
+  }
+
+  if (!annotation_applied) {
     # Just create basic UMAP for gene-level
     p <- DimPlot(sce.gene)
     ggsave(file.path(opts$output_dir, "gene_cluster_umap.pdf"),

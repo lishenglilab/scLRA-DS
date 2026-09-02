@@ -34,6 +34,10 @@ option_list <- list(
               help="Path to stage mapping file (TSV: sample, stage)", metavar="FILE"),
   make_option(c("-c", "--comparison"), type="character", default="AD_vs_Normal",
               help="Comparison name (e.g., AD_vs_Normal) [default: %default]", metavar="STR"),
+  make_option(c("--reference_group"), type="character", default=NULL,
+              help="Reference group; avoids inferring it from the comparison name", metavar="STR"),
+  make_option(c("--test_group"), type="character", default=NULL,
+              help="Test group; avoids inferring it from the comparison name", metavar="STR"),
   make_option(c("--cpc2_result"), type="character", default="",
               help="Path to CPC2 result file (optional)", metavar="FILE"),
   make_option(c("--pfam_result"), type="character", default="",
@@ -70,6 +74,8 @@ fasta_file <- opt$fasta_file
 output_dir <- opt$output_dir
 stage_mapping_file <- opt$stage_mapping
 comparison_name <- opt$comparison
+reference_group <- opt$reference_group
+test_group <- opt$test_group
 cpc2_result <- opt$cpc2_result
 pfam_result <- opt$pfam_result
 signalp_result <- opt$signalp_result
@@ -111,7 +117,7 @@ log_message(paste("dIF cutoff:", dIF_cutoff))
 log_message(paste("Alpha:", alpha))
 
 # Set parallel processing
-options(future.globals.maxSize = 80000000 * 1024^2)
+options(future.globals.maxSize = 80 * 1024^3)
 plan(multisession, workers = n_cores)
 
 # ----------------------------------------------------------------------
@@ -191,7 +197,7 @@ if (!is.null(stage_mapping_file) && file.exists(stage_mapping_file)) {
     if ("orig.ident" %in% colnames(sce.tr@meta.data)) {
       sce.tr$sample <- sce.tr$orig.ident
     } else {
-      sce.tr$sample <- gsub("_.*", "", colnames(sce.tr))
+      sce.tr$sample <- sub("_[^_]+$", "", colnames(sce.tr))
     }
     
     # Merge stage information
@@ -208,7 +214,7 @@ if (!is.null(stage_mapping_file) && file.exists(stage_mapping_file)) {
     if ("orig.ident" %in% colnames(sce.gene@meta.data)) {
       sce.gene$sample <- sce.gene$orig.ident
     } else {
-      sce.gene$sample <- gsub("_.*", "", colnames(sce.gene))
+      sce.gene$sample <- sub("_[^_]+$", "", colnames(sce.gene))
     }
     
     sce.gene$stage <- stage_mapping$stage[match(sce.gene$sample, stage_mapping$sample)]
@@ -225,14 +231,14 @@ if (!is.null(stage_mapping_file) && file.exists(stage_mapping_file)) {
   if (!is.null(sce.tr)) {
     sce.tr$sample <- ifelse("orig.ident" %in% colnames(sce.tr@meta.data), 
                             sce.tr$orig.ident, 
-                            gsub("_.*", "", colnames(sce.tr)))
+                            sub("_[^_]+$", "", colnames(sce.tr)))
     sce.tr$stage <- gsub("[0-9].*", "", sce.tr$sample)
   }
   
   if (!is.null(sce.gene)) {
     sce.gene$sample <- ifelse("orig.ident" %in% colnames(sce.gene@meta.data), 
                               sce.gene$orig.ident, 
-                              gsub("_.*", "", colnames(sce.gene)))
+                              sub("_[^_]+$", "", colnames(sce.gene)))
     sce.gene$stage <- gsub("[0-9].*", "", sce.gene$sample)
   }
 }
@@ -310,14 +316,23 @@ sample_groups <- sapply(sample_ids, function(x) {
   unique(colData(sce.tr)$stage[colData(sce.tr)$sample_id == x])
 })
 
-# Parse comparison name to get groups
-comparison_groups <- strsplit(comparison_name, "_vs_")[[1]]
-if (length(comparison_groups) != 2) {
-  stop(paste("Invalid comparison name format:", comparison_name, "Expected format: Group1_vs_Group2"))
+# Prefer explicit group values from the workflow. Keep comparison-name parsing
+# as a compatibility fallback for existing direct callers.
+if (!is.null(reference_group) && nzchar(reference_group) &&
+    !is.null(test_group) && nzchar(test_group)) {
+  ref_group <- reference_group
+  test_group <- test_group
+} else {
+  comparison_groups <- strsplit(comparison_name, "_vs_", fixed = TRUE)[[1]]
+  if (length(comparison_groups) != 2) {
+    stop(paste(
+      "Cannot infer groups from comparison name:", comparison_name,
+      "Provide --reference_group and --test_group"
+    ))
+  }
+  ref_group <- comparison_groups[1]
+  test_group <- comparison_groups[2]
 }
-
-ref_group <- comparison_groups[1]
-test_group <- comparison_groups[2]
 
 log_message(paste("Reference group:", ref_group))
 log_message(paste("Test group:", test_group))
@@ -429,18 +444,25 @@ switchlist_file <- file.path(output_dir, paste0("switchList_prep_", comparison_n
 saveRDS(aSwitchList, switchlist_file)
 
 # Save preparation summary
+external_tools_used <- c(
+  ifelse(cpc2_result != "" && file.exists(cpc2_result), "CPC2", ""),
+  ifelse(pfam_result != "" && file.exists(pfam_result), "PFAM", ""),
+  ifelse(signalp_result != "" && file.exists(signalp_result), "SignalP", ""),
+  ifelse(iupred2a_result != "" && file.exists(iupred2a_result), "IUPred2A", "")
+)
+external_tools_used <- external_tools_used[nzchar(external_tools_used)]
+
 summary_stats <- list(
   Total_Isoforms_Analyzed = nrow(aSwitchList$isoformFeatures),
   Total_Genes_Analyzed = length(unique(aSwitchList$isoformFeatures$gene_id)),
   Comparison = comparison_name,
   Reference_Group = ref_group,
   Test_Group = test_group,
-  External_Tools_Used = paste(c(
-    ifelse(cpc2_result != "" && file.exists(cpc2_result), "CPC2", ""),
-    ifelse(pfam_result != "" && file.exists(pfam_result), "PFAM", ""),
-    ifelse(signalp_result != "" && file.exists(signalp_result), "SignalP", ""),
-    ifelse(iupred2a_result != "" && file.exists(iupred2a_result), "IUPred2A", "")
-  )[c(1:4) != ""], collapse = ", "),
+  External_Tools_Used = ifelse(
+    length(external_tools_used) > 0,
+    paste(external_tools_used, collapse = ", "),
+    "None"
+  ),
   Preparation_Date = as.character(Sys.time())
 )
 
